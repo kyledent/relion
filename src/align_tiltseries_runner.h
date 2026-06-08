@@ -145,6 +145,12 @@ public:
     // Use AreTomo
     bool do_aretomo;
 
+    // Use AreTomo3 (different CLI than AreTomo2; reuses the AreTomo execute/read code paths)
+    bool do_aretomo3;
+
+    // AreTomo3 executable
+    FileName fn_aretomo3_exe;
+
     // Perform tilt angle correction in AreTomo
     bool do_aretomo_tiltcorrect;
 

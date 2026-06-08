@@ -43,6 +43,8 @@ void AlignTiltseriesRunner::read(int argc, char **argv, int rank)
     int aretomo2_section = parser.addSection("AreTomo2 alignment options");
     do_aretomo = parser.checkOption("--aretomo2", "OR: Use AreTomo2 alignment method");
     fn_aretomo_exe = parser.getOption("--aretomo_exe", "AreTomo executable (can be set through $RELION_ARETOMO_EXECUTABLE, defaults to AreTomo2)", "");
+    do_aretomo3 = parser.checkOption("--aretomo3", "OR: Use AreTomo3 alignment method (different CLI than AreTomo2)");
+    fn_aretomo3_exe = parser.getOption("--aretomo3_exe", "AreTomo3 executable (can be set through $RELION_ARETOMO3_EXECUTABLE, defaults to AreTomo3)", "");
     do_aretomo_tiltcorrect = parser.checkOption("--aretomo_tiltcorrect", "Specify to correct the tilt angle offset in the tomogram (AreTomo -TiltCor option; default=false)");
     aretomo_tilcorrect_angle = textToFloat(parser.getOption("--aretomo_tiltcorrect_angle", "User-specified tilt angle correction (value > 180, means estimate automatically", "999."));
     do_aretomo_ctf = parser.checkOption("--aretomo_ctf", "Perform CTF estimation in AreTomo? (default=false)");
@@ -104,6 +106,13 @@ void AlignTiltseriesRunner::initialise(bool is_leader)
         }
     }
 
+    if (fn_aretomo3_exe == "")
+    {
+        char *penv;
+        penv = getenv("RELION_ARETOMO3_EXECUTABLE");
+        fn_aretomo3_exe = (penv != NULL) ? (std::string)penv : "AreTomo3";
+    }
+
 
     if (fn_adoc_template != "")
     {
@@ -133,7 +142,8 @@ void AlignTiltseriesRunner::initialise(bool is_leader)
     if (do_imod_fiducials) i++;
     if (do_imod_patchtrack) i++;
     if (do_aretomo) i++;
-    if (i != 1) REPORT_ERROR("ERROR: you need to specify one of these options: --imod_fiducials or --imod_patchtrack or --aretomo");
+    if (do_aretomo3) i++;
+    if (i != 1) REPORT_ERROR("ERROR: you need to specify one of these options: --imod_fiducials or --imod_patchtrack or --aretomo2 or --aretomo3");
 
 	// Make sure fn_out ends with a slash
 	if (fn_out[fn_out.length()-1] != '/')
@@ -197,7 +207,7 @@ void AlignTiltseriesRunner::initialise(bool is_leader)
 		std::cout  << do_at_most << " tomograms as specified in --do_at_most." << std::endl;
 	}
 
-    if (do_aretomo)
+    if (do_aretomo || do_aretomo3)
     {
         if (gpu_ids.length() > 0)
             untangleDeviceIDs(gpu_ids, allThreadIDs);
@@ -207,7 +217,9 @@ void AlignTiltseriesRunner::initialise(bool is_leader)
 
     if (verb > 0)
 	{
-        if (do_aretomo)
+        if (do_aretomo3)
+            std::cout << " Using AreTomo3 executable in: " << fn_aretomo3_exe << std::endl;
+        else if (do_aretomo)
             std::cout << " Using AreTomo executable in: " << fn_aretomo_exe << std::endl;
         else
             std::cout << " Using batchruntomo executable in: " << fn_batchtomo_exe << std::endl;
@@ -238,7 +250,7 @@ void AlignTiltseriesRunner::run()
         if (pipeline_control_check_abort_job())
             exit(RELION_EXIT_ABORTED);
 
-        if (do_aretomo)
+        if (do_aretomo || do_aretomo3)
         {
             executeAreTomo(idx_tomograms[itomo]);
         }
@@ -263,7 +275,7 @@ bool AlignTiltseriesRunner::checkResults(long idx_tomo)
     std::string tomoname = tomogramSet.getTomogramName(idx_tomo);
     FileName fn_dir = fn_out + "external/" + tomoname + '/';
 
-    if (do_aretomo)
+    if (do_aretomo || do_aretomo3)
     {
         // check that .aln (and _ctf.txt if do_aretomo_ctf) file(s) has been written out
         FileName fn_aln = fn_dir + tomoname + ".aln";
@@ -489,7 +501,89 @@ void AlignTiltseriesRunner::executeAreTomo(long idx_tomo, int rank)
     RFLOAT thickness_pix = mythickness*10./pixel_size;
 
     // Now run the actual AreTomo command
-    std::string command = fn_aretomo_exe + " ";
+    std::string command;
+
+    if (do_aretomo3)
+    {
+        // ===== AreTomo3 backend =====
+        // AreTomo3 has a different CLI than AreTomo2 (see
+        // survey/cluster/reference/aretomo2_vs_aretomo3_cli.md): pre-assembled stack
+        // input via -InPrefix/-InSuffix .mrc (tilt angles auto-read from the paired
+        // <base>.rawtlt that was just written), output to -OutDir, -AtBin in place of
+        // -OutBin. -AngFile/-ImgDose/-OutMrc/-InMrc have no AreTomo3 equivalent (the
+        // first two are auto/not-needed; AreTomo3 ignores unknown flags).
+        // EXPERIMENTAL: the exact AreTomo3 flags and output naming must still be
+        // verified against a real AreTomo3 binary (RELION_ARETOMO3_SUPPORT_PLAN.md).
+        command = fn_aretomo3_exe + " ";
+        command += " -InPrefix " + fn_dir + tomoname;   // base of <base>.mrc + <base>.rawtlt
+        command += " -InSuffix .mrc";
+        command += " -OutDir " + fn_dir;
+
+        if (do_only_aretomo_reconstruct)
+            command += " -Align 0 ";
+        else
+            command += " -AlignZ " + floatToString(thickness_pix);
+
+        if (do_aretomo_reconstruct)
+        {
+            command += " -FlipVol 1 -VolZ " + integerToString(aretomo_VolZ);
+            command += " -AtBin " + integerToString(aretomo_OutBin);
+            if (do_aretomo_sart)
+                command += " -Sart " + integerToString(aretomo_sart_iter) + " " + integerToString(aretomo_sart_proj);
+            else
+                command += " -Wbp 1";
+        }
+        else
+            command += " -VolZ 0";
+
+        if (!do_only_aretomo_reconstruct)
+        {
+            if (tomogramSet.tomogramTables[idx_tomo].containsLabel(EMDL_TOMO_NOMINAL_TILT_AXIS_ANGLE))
+                command += " -TiltAxis " + floatToString(tomogramSet.tomogramTables[idx_tomo].getDouble(EMDL_TOMO_NOMINAL_TILT_AXIS_ANGLE, 0));
+
+            if (do_aretomo_tiltcorrect)
+            {
+                command += " -TiltCor 1 ";
+                if (aretomo_tilcorrect_angle < 180.) command += floatToString(aretomo_tilcorrect_angle);
+            }
+            else
+                command += " -TiltCor -1 ";
+
+            if (do_aretomo_ctf)
+            {
+                RFLOAT kV, Cs, Q0;
+                RFLOAT angpix = tomogramSet.getTiltSeriesPixelSize(idx_tomo);
+                tomogramSet.globalTable.getValue(EMDL_CTF_VOLTAGE, kV, idx_tomo);
+                tomogramSet.globalTable.getValue(EMDL_CTF_CS, Cs, idx_tomo);
+                tomogramSet.globalTable.getValue(EMDL_CTF_Q0, Q0, idx_tomo);
+                command += " -Kv " + floatToString(kV) + " -Cs " + floatToString(Cs);
+                command += " -AmpContrast " + floatToString(Q0) + " -PixSize " + floatToString(angpix);
+                if (do_aretomo_phaseshift) command += " -ExtPhase 90 180";
+            }
+        }
+
+        if (gpu_ids.length() > 0)
+        {
+            if (rank >= allThreadIDs.size())
+                REPORT_ERROR("ERROR: not enough MPI nodes specified for the GPU IDs.");
+            command += " -Gpu ";
+            for (int igpu = 0; igpu < allThreadIDs[rank].size(); igpu++)
+                command += allThreadIDs[rank][igpu] + " ";
+        }
+        if (other_wrapper_args.length() > 0)
+            command += " " + other_wrapper_args;
+        command += " > " + fn_log + " 2>&1 ";
+
+        std::ofstream fhc3;
+        fhc3.open((fn_com).c_str(), std::ios::out);
+        fhc3 << command << std::endl;
+        fhc3.close();
+        if (system(command.c_str()))
+            std::cerr << "WARNING: there was an error in executing: " << command << std::endl;
+        return;
+    }
+
+    command = fn_aretomo_exe + " ";
     command += " -InMrc " + fn_series;
     command += " -OutMrc " + fn_ali;
 
@@ -910,7 +1004,8 @@ bool AlignTiltseriesRunner::readAreTomoResults(long idx_tomo, std::string &error
     if (do_aretomo_reconstruct)
     {
         std::string tomoname = tomogramSet.getTomogramName(idx_tomo);
-        FileName fn_inmap = fn_out + "external/" + tomoname + "/" + tomoname + "_aligned.mrc";
+        // AreTomo2 names the reconstruction <base>_aligned.mrc (-OutMrc); AreTomo3 writes <base>_Vol.mrc in -OutDir
+        FileName fn_inmap = fn_out + "external/" + tomoname + "/" + tomoname + (do_aretomo3 ? "_Vol.mrc" : "_aligned.mrc");
         FileName fn_tomodir = fn_out + "tomograms/";
         if (!exists(fn_tomodir)) mktree(fn_tomodir);
         FileName fn_outmap = fn_tomodir + "rec_" + tomoname + ".mrc";
@@ -990,7 +1085,7 @@ void AlignTiltseriesRunner::joinResults()
     std::vector<std::string> failed_tomograms;
     for (long itomo = 0; itomo < tomogramSet.size(); itomo++)
     {
-        if (do_aretomo)
+        if (do_aretomo || do_aretomo3)
         {
             if (!readAreTomoResults(itomo, error_message))
             {
@@ -1040,10 +1135,10 @@ void AlignTiltseriesRunner::joinResults()
         }
     }
 
-    FileName fnt = (do_aretomo && do_aretomo_reconstruct) ? fn_out+"tomograms.star" : fn_out+"aligned_tilt_series.star";
+    FileName fnt = ((do_aretomo || do_aretomo3) && do_aretomo_reconstruct) ? fn_out+"tomograms.star" : fn_out+"aligned_tilt_series.star";
     tomogramSet.write(fnt);
 
-    if (do_aretomo && do_aretomo_ctf)
+    if ((do_aretomo || do_aretomo3) && do_aretomo_ctf)
     {
         if (verb > 0) std::cout << " Saving a file called " << fn_out << "power_spectra_fits.star for visualisation of Thon ring fits..." << std::endl;
         MDpower.deactivateLabel(EMDL_MICROGRAPH_NAME);
@@ -1070,7 +1165,7 @@ void AlignTiltseriesRunner::joinResults()
         plot_labels.push_back(EMDL_TOMO_IMOD_ERROR_MEAN);
         plot_labels.push_back(EMDL_TOMO_IMOD_ERROR_STDDEV);
     }
-    else if (do_aretomo)
+    else if (do_aretomo || do_aretomo3)
     {
         plot_labels.push_back(EMDL_TOMO_ZROT);
         plot_labels.push_back(EMDL_TOMO_ARETOMO_TILTAXIS_SCORE);
@@ -1115,7 +1210,7 @@ void AlignTiltseriesRunner::joinResults()
         FileName fn_eps_shift = fn_dir + tomoname + "_shifts.eps";
         all_fn_eps.push_back(fn_eps_tilt);
         all_fn_eps.push_back(fn_eps_shift);
-        if (do_aretomo && do_aretomo_ctf)
+        if ((do_aretomo || do_aretomo3) && do_aretomo_ctf)
         {
             FileName fn_eps_defocus = fn_dir + tomoname + "_defocus.eps";
             FileName fn_eps_ctffom = fn_dir + tomoname + "_ctfscore.eps";

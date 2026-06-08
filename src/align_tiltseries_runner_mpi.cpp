@@ -60,7 +60,7 @@ void AlignTiltseriesRunnerMpi::run()
         if (pipeline_control_check_abort_job())
             MPI_Abort(MPI_COMM_WORLD, RELION_EXIT_ABORTED);
 
-        if (do_aretomo)
+        if (do_aretomo || do_aretomo3)
         {
             executeAreTomo(idx_tomograms[itomo], node->rank);
         }
