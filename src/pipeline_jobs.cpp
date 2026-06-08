@@ -6673,6 +6673,35 @@ void RelionJob::initialiseTomoAlignTiltSeriesJob()
     joboptions["other_aretomo_args"] = JobOption("Other AreTomo2 arguments", std::string(""), "Additional arguments that need to be passed to AreTomo2.");
 	joboptions["gpu_ids"] = JobOption("Which GPUs to use for AreTomo:", std::string(""), "Provide a list of which GPUs (e.g. 0:1:2:3) to use in AreTomo2. MPI-processes are separated by ':'. For example, to place one rank on device 0 and one rank on device 1, provide '0:1'.");
 
+    // ====================  AreTomo3 (separate backend, own tab)  ====================
+    // AreTomo3 uses a different command-line interface than AreTomo2 (mdoc/stack input
+    // via -InPrefix/-InSuffix, -OutDir not -OutMrc, no -AngFile/-ImgDose, -AtPatch/-AtBin).
+    // The runner translates RELION's call when --aretomo3 is given. See
+    // survey/cluster/reference/aretomo2_vs_aretomo3_cli.md.
+    joboptions["do_aretomo3"] = JobOption("Use AreTomo3?", false, "Set to Yes to perform tilt series alignment using AreTomo3 instead of AreTomo2.");
+
+    default_location = getenv("RELION_ARETOMO3_EXECUTABLE");
+    char default_aretomo3[] = "AreTomo3";
+    if (default_location == NULL)
+    {
+        default_location = default_aretomo3;
+    }
+    joboptions["fn_aretomo3_exe"] = JobOption("AreTomo3 executable:", std::string(default_location), "*", ".", "Location of the AreTomo3 executable (an absolute path, or a command on your PATH such as 'AreTomo3'). You can control the default of this field by setting environment variable RELION_ARETOMO3_EXECUTABLE.");
+
+    joboptions["do_aretomo3_tiltcorrect"] = JobOption("Correct Tilt Angle Offset?", false, "As for AreTomo2: apply the AreTomo -TiltCor option to correct a tilt-angle offset (useful for in situ / milled lamellae).");
+    joboptions["aretomo3_tiltcorrect_angle"] = JobOption("Tilt Angle Offset:", 999, -50, 50, 5, "The tilt-angle offset (in degrees). If set to a value larger than 180, AreTomo3 searches for the optimal value itself, otherwise the value specified here is used.");
+
+    joboptions["do_aretomo3_ctf"] = JobOption("Also do CTF estimation?", false, "If set to Yes, AreTomo3 also performs CTF estimation (overwriting any CTF already in the input STAR files).");
+    joboptions["do_aretomo3_phaseshift"] = JobOption("Also estimate phase shift?", false, "If set to Yes, AreTomo3 also estimates the phase shift (due to a phase plate) during CTF estimation.");
+
+    joboptions["do_aretomo3_reconstruct"] = JobOption("Reconstruct tomograms?", false, "If set to Yes, AreTomo3 also reconstructs the tomograms (weighted back-projection by default; SART can be requested via the Other arguments field).");
+    joboptions["do_skip_aretomo3_align"] = JobOption("Skip alignment and only reconstruct?", false, "If set to Yes, AreTomo3 alignment (and CTF estimation) is skipped and only reconstruction is performed, using alignment parameters already present in the input tiltseries STAR file.");
+    joboptions["aretomo3_VolZ"] = JobOption("Tomogram thickness (in unbinned voxels):", 1000, 50, 5000, 50, "The tomogram is reconstructed to this thickness, using AreTomo3's -VolZ parameter.");
+    joboptions["aretomo3_OutBin"] = JobOption("Tomogram binning:", 4, 1, 20, 1, "The tomogram is reconstructed with this integer binning factor, using AreTomo3's -AtBin parameter.");
+
+    joboptions["other_aretomo3_args"] = JobOption("Other AreTomo3 arguments", std::string(""), "Additional arguments that need to be passed to AreTomo3.");
+    joboptions["gpu_ids_aretomo3"] = JobOption("Which GPUs to use for AreTomo3:", std::string(""), "Provide a list of which GPUs (e.g. 0:1:2:3) to use in AreTomo3. MPI-processes are separated by ':'.");
+
 }
 bool RelionJob::getCommandsTomoAlignTiltSeriesJob(std::string &outputname, std::vector<std::string> &commands,
                                        std::string &final_command, bool do_makedir, int job_counter, std::string &error_message)
@@ -6685,9 +6714,10 @@ bool RelionJob::getCommandsTomoAlignTiltSeriesJob(std::string &outputname, std::
 	if (joboptions["do_imod_fiducials"].getBoolean()) i++;
 	if (joboptions["do_imod_patchtrack"].getBoolean()) i++;
 	if (joboptions["do_aretomo2"].getBoolean()) i++;
+	if (joboptions["do_aretomo3"].getBoolean()) i++;
 	if (i != 1)
 	{
-		error_message = "ERROR: you should (only) select ONE of the alignment methods: IMOD:fiducials or IMOD:patchtracking or AreTomo.";
+		error_message = "ERROR: you should (only) select ONE of the alignment methods: IMOD:fiducials or IMOD:patchtracking or AreTomo2 or AreTomo3.";
 		return false;
 	}
 
@@ -6763,6 +6793,42 @@ bool RelionJob::getCommandsTomoAlignTiltSeriesJob(std::string &outputname, std::
         command += " --gpu " + joboptions["gpu_ids"].getString() + ' ';
 
 	}
+	else if (joboptions["do_aretomo3"].getBoolean())
+	{
+		command += " --aretomo3 ";
+		command += " --aretomo3_exe " + joboptions["fn_aretomo3_exe"].getString();
+
+		if (joboptions["do_aretomo3_tiltcorrect"].getBoolean())
+		{
+			command += " --aretomo_tiltcorrect ";
+			command += " --aretomo_tiltcorrect_angle " + joboptions["aretomo3_tiltcorrect_angle"].getString();
+		}
+
+		if (joboptions["do_aretomo3_ctf"].getBoolean())
+		{
+			command += " --aretomo_ctf ";
+			if (joboptions["do_aretomo3_phaseshift"].getBoolean())
+			{
+				command += " --aretomo_phaseshift ";
+			}
+
+			// Tomo-specific output file for display button
+			Node node4(outputname + "power_spectra_fits.star", LABEL_CTFFIND_POWER_SPECTRA);
+			outputNodes.push_back(node4);
+		}
+
+		if (joboptions["do_aretomo3_reconstruct"].getBoolean())
+		{
+			command += " --aretomo_reconstruct ";
+			if (joboptions["do_skip_aretomo3_align"].getBoolean())
+				command += " --aretomo_only_reconstruct ";
+			command += " --aretomo_VolZ " + joboptions["aretomo3_VolZ"].getString();
+			command += " --aretomo_OutBin " + joboptions["aretomo3_OutBin"].getString();
+		}
+
+		command += " --other_wrapper_args \" " + joboptions["other_aretomo3_args"].getString() + " \"";
+		command += " --gpu " + joboptions["gpu_ids_aretomo3"].getString() + ' ';
+	}
 
     if (is_continue)
     {
@@ -6772,7 +6838,8 @@ bool RelionJob::getCommandsTomoAlignTiltSeriesJob(std::string &outputname, std::
 	Node node(joboptions["in_tiltseries"].getString(), joboptions["in_tiltseries"].node_type);
 	inputNodes.push_back(node);
 
-	FileName fn_output = (joboptions["do_aretomo2"].getBoolean() && joboptions["do_aretomo_reconstruct"].getBoolean()) ?
+	FileName fn_output = ((joboptions["do_aretomo2"].getBoolean() && joboptions["do_aretomo_reconstruct"].getBoolean()) ||
+	                      (joboptions["do_aretomo3"].getBoolean() && joboptions["do_aretomo3_reconstruct"].getBoolean())) ?
             outputname+"tomograms.star" : outputname+"aligned_tilt_series.star";
     Node node2(fn_output, LABEL_TILTALIGN_TOMOGRAMS);
 	outputNodes.push_back(node2);
