@@ -48,7 +48,7 @@ void AlignTiltseriesRunner::read(int argc, char **argv, int rank)
     do_aretomo_tiltcorrect = parser.checkOption("--aretomo_tiltcorrect", "Specify to correct the tilt angle offset in the tomogram (AreTomo -TiltCor option; default=false)");
     aretomo_tilcorrect_angle = textToFloat(parser.getOption("--aretomo_tiltcorrect_angle", "User-specified tilt angle correction (value > 180, means estimate automatically", "999."));
     do_aretomo_ctf = parser.checkOption("--aretomo_ctf", "Perform CTF estimation in AreTomo? (default=false)");
-    do_aretomo_phaseshift = parser.checkOption("--aretomo_phaseshift", "Perform CTF estimation in AreTomo?");
+    do_aretomo_phaseshift = parser.checkOption("--aretomo_phaseshift", "Also estimate the phase shift (e.g. from a Volta phase plate) during AreTomo CTF estimation (passes -ExtPhase)? Requires --aretomo_ctf.");
     do_aretomo_reconstruct = parser.checkOption("--aretomo_reconstruct", "Perform Tomogram reconstruction (WBP) in AreTomo?");
     do_only_aretomo_reconstruct = parser.checkOption("--aretomo_only_reconstruct", "Only perform Tomogram reconstruction in AreTomo, and skip alignment/CTF estimation?");
     if (do_only_aretomo_reconstruct) do_aretomo_reconstruct = true;
@@ -629,7 +629,7 @@ void AlignTiltseriesRunner::executeAreTomo(long idx_tomo, int rank)
     }
     if (do_aretomo_reconstruct)
     {
-        command += " -FlipVol 1 -volZ " + integerToString(aretomo_VolZ);
+        command += " -FlipVol 1 -VolZ " + integerToString(aretomo_VolZ);
         command += " -OutBin " + integerToString(aretomo_OutBin);
         if (do_aretomo_sart)
         {
@@ -642,7 +642,7 @@ void AlignTiltseriesRunner::executeAreTomo(long idx_tomo, int rank)
     }
     else
     {
-        command += " -volZ 0";
+        command += " -VolZ 0";
     }
 
 
