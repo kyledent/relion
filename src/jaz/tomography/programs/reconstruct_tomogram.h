@@ -79,6 +79,8 @@ class TomoBackprojectProgram
             double tiltAngleOffset;
             double BfactorPerElectronDose;
             double lambda;
+            bool do_gpu;     // GPU real-space WBP (Route B)
+            int gpu_id;      // CUDA device id for the GPU WBP
 
             std::vector<long> tomoIndexTodo;
 			OptimisationSet optimisationSet;

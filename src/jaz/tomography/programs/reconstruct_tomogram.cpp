@@ -11,6 +11,10 @@
 #include <src/backprojector.h>
 #include <src/parallel.h>
 
+#ifdef _CUDA_ENABLED
+#include <src/jaz/cuda/real_backprojection_gpu.h>
+#endif
+
 
 #include <omp.h>
 
@@ -124,6 +128,16 @@ void TomoBackprojectProgram::readParameters(int argc, char *argv[])
     zeroDC = !parser.checkOption("--keep_mean", "Do not zero the DC component of each frame");
     taperDist = textToDouble(parser.getOption("--td", "Tapering distance", "0.0"));
     taperFalloff = textToDouble(parser.getOption("--tf", "Tapering falloff", "0.0"));
+
+    do_gpu = parser.checkOption("--gpu", "Use the GPU for real-space weighted back-projection (Route B)");
+    gpu_id = textToInteger(parser.getOption("--gpu_id", "CUDA device id for --gpu", "0"));
+#ifndef _CUDA_ENABLED
+    if (do_gpu)
+    {
+        std::cerr << "WARNING: --gpu requested but RELION was built without CUDA support; reconstructing on the CPU." << std::endl;
+        do_gpu = false;
+    }
+#endif
 
     // SHWS & Aburt 19Jul2022: use zero-origins from relion-4.1 onwards....
     x0 = textToDouble(parser.getOption("--x0", "X origin", "0.0"));
@@ -785,23 +799,49 @@ void TomoBackprojectProgram::reconstructOneTomogram(int tomoIndex, bool doEven, 
         stackAct = RealSpaceBackprojection::preWeight(stackAct, projAct, n_threads);
 	}
 
-    if (!do_multiple) Log::print("Backprojecting");
-	
-	RealSpaceBackprojection::backproject(
-		stackAct, projAct, out, n_threads,
-		orig, spacing, RealSpaceBackprojection::Linear, taperFalloff, taperDist);
-	
-	
+    if (!do_multiple) Log::print(do_gpu ? "Backprojecting (GPU)" : "Backprojecting");
+
+	// Real-space WBP, GPU (Route B) or CPU. The GPU kernel implements the default
+	// Linear, no-taper path; tapering falls back to CPU. (do_gpu is already forced
+	// off in readParameters for non-CUDA builds.)
+	const bool useGpu = do_gpu && taperFalloff == 0.0 && taperDist == 0.0;
+	auto doBackproject = [&](BufferedImage<float>& src, BufferedImage<float>& dst)
+	{
+#ifdef _CUDA_ENABLED
+		if (useGpu)
+		{
+			// rows 0 and 1 of each 4x4 proj matrix (gravis t4Matrix is column-major,
+			// so use operator()(row,col), not the flat m[] index)
+			std::vector<double> projRows((size_t) fc * 8);
+			for (int f = 0; f < fc; f++)
+				for (int c = 0; c < 4; c++)
+				{
+					projRows[(size_t) f * 8 + c]     = projAct[f](0, c);
+					projRows[(size_t) f * 8 + 4 + c] = projAct[f](1, c);
+				}
+			wbpBackprojectGPU(
+					src.data, projRows.data(), fc, src.xdim, src.ydim,
+					dst.xdim, dst.ydim, dst.zdim,
+					orig.x, orig.y, orig.z, spacing, dst.data, gpu_id);
+			return;
+		}
+#endif
+		RealSpaceBackprojection::backproject(
+				src, projAct, dst, n_threads,
+				orig, spacing, RealSpaceBackprojection::Linear, taperFalloff, taperDist);
+	};
+
+	doBackproject(stackAct, out);
+
+
 	if ((applyWeight || applyCtf) && doWiener)
 	{
 		BufferedImage<float> psf(w1, h1, t1);
 		psf.fill(0.f);
-		
+
 		if (applyCtf)
 		{
-			RealSpaceBackprojection::backproject(
-					psfStack, projAct, psf, n_threads, 
-					orig, spacing, RealSpaceBackprojection::Linear, taperFalloff, taperDist);
+			doBackproject(psfStack, psf);
 		}
 		else
 		{
