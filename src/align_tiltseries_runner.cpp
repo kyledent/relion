@@ -157,6 +157,7 @@ void AlignTiltseriesRunner::initialise(bool is_leader)
 
 	idx_tomograms_all.clear();
 	idx_tomograms.clear();
+	std::vector<long int> idx_tomograms_skipped; // already-complete tomograms (--only_do_unfinished)
 	bool warned = false;
 	for (long int itomo = 0; itomo < tomogramSet.size(); itomo++)
 	{
@@ -172,6 +173,7 @@ void AlignTiltseriesRunner::initialise(bool is_leader)
 			if (checkResults(itomo))
 			{
 				process_this = false; // already done
+				idx_tomograms_skipped.push_back(itomo);
 			}
 		}
 
@@ -223,11 +225,30 @@ void AlignTiltseriesRunner::initialise(bool is_leader)
             std::cout << " Using AreTomo executable in: " << fn_aretomo_exe << std::endl;
         else
             std::cout << " Using batchruntomo executable in: " << fn_batchtomo_exe << std::endl;
-		std::cout << " to align tilt series for the following tomograms: " << std::endl;
-		if (continue_old)
-			std::cout << " (skipping all tomograms for output files with tilt series alignment parameters already exists)" << std::endl;
+
+		std::cout << " Found " << tomogramSet.size() << " tomograms in the input tomogram set." << std::endl;
+
+		// When continuing, say exactly how many were skipped and what "already complete" means,
+		// so a short to-do list is self-explanatory and not mistaken for lost data.
+		if (continue_old && idx_tomograms_skipped.size() > 0)
+		{
+			std::string req;
+			if (do_aretomo || do_aretomo3)
+			{
+				req = ".aln";
+				if (do_aretomo_ctf) req += " + _ctf.txt";
+				if (do_aretomo_reconstruct) req += " + tomograms/rec_*.mrc";
+			}
+			else
+				req = ".xf + .tlt";
+			std::cout << " --only_do_unfinished: " << idx_tomograms_skipped.size() << " of " << tomogramSet.size()
+			          << " tomograms already complete (have " << req << ") - skipping them." << std::endl;
+		}
+
+		std::cout << " " << idx_tomograms.size() << " tomograms to align:" << std::endl;
 		for (unsigned  int  i = 0; i < idx_tomograms.size(); ++i)
-			std::cout << "  * " << tomogramSet.getTomogramName(idx_tomograms[i]) << std::endl;
+			std::cout << "   [" << (i + 1) << "/" << idx_tomograms.size() << "] "
+			          << tomogramSet.getTomogramName(idx_tomograms[i]) << std::endl;
 	}
 }
 
@@ -282,7 +303,14 @@ bool AlignTiltseriesRunner::checkResults(long idx_tomo)
         FileName fn_ctf = fn_dir + tomoname + "_ctf.txt";
         FileName fn_tomo = fn_out + "tomograms/rec_" + tomoname + ".mrc";
 
+        // A zero-byte .aln means AreTomo started but failed; don't treat it as complete,
+        // otherwise --only_do_unfinished would skip the failed tomogram forever.
         bool has_required = exists(fn_aln);
+        if (has_required)
+        {
+            std::ifstream alnf(fn_aln.c_str(), std::ios::binary | std::ios::ate);
+            has_required = (alnf.good() && alnf.tellg() > 0);
+        }
         if (has_required && do_aretomo_ctf) has_required = exists(fn_ctf);
         if (has_required && do_aretomo_reconstruct) has_required = exists(fn_tomo);
         return has_required;

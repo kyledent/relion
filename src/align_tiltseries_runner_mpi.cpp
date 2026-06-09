@@ -47,7 +47,22 @@ void AlignTiltseriesRunnerMpi::run()
     int barstep;
     if (verb > 0)
     {
-        std::cout << " Aligning tilt series ..." << std::endl;
+        // Leader-only: show how the tomograms are split across MPI processes, so a
+        // per-share progress bar reaching 100% isn't mistaken for the whole job finishing.
+        if (idx_tomograms.size() > 0)
+        {
+            std::cout << " Distributing " << idx_tomograms.size() << " tomograms across "
+                      << node->size << " MPI process(es):" << std::endl;
+            for (int r = 0; r < node->size; r++)
+            {
+                long int rf, rl;
+                divide_equally(idx_tomograms.size(), node->size, r, rf, rl);
+                std::cout << "   rank " << r << ": " << (rl - rf + 1) << " tomograms ("
+                          << (rf + 1) << "-" << (rl + 1) << ")" << std::endl;
+            }
+        }
+        std::cout << " Aligning tilt series (progress for this leader's share of "
+                  << my_nr_tomograms << ") ..." << std::endl;
         init_progress_bar(my_nr_tomograms);
         barstep = XMIPP_MAX(1, my_nr_tomograms / 60);
     }
@@ -69,7 +84,9 @@ void AlignTiltseriesRunnerMpi::run()
             executeIMOD(idx_tomograms[itomo], node->rank);
         }
 
-        if (verb > 0 && itomo % barstep == 0) progress_bar(itomo);
+        // Progress is relative to this rank's share (itomo is an absolute index into idx_tomograms)
+        if (verb > 0 && (itomo - my_first_tomogram) % barstep == 0)
+            progress_bar(itomo - my_first_tomogram);
 
     }
 
