@@ -722,12 +722,14 @@ bool AlignTiltseriesRunner::readIMODResults(long idx_tomo, std::string &error_me
         tomogramSet.tomogramTables[idx_tomo].setValue(EMDL_TOMO_YSHIFT_ANGST, -image_shifts(1) * angpix, f);
 
         // get in-plane rotation (zrot)
-        RFLOAT myzrot = RAD2DEG(acos(A(0, 0)));
-        RFLOAT inizrot;
-        tomogramSet.tomogramTables[idx_tomo].getValue(EMDL_TOMO_NOMINAL_TILT_AXIS_ANGLE, inizrot, f);
-        RFLOAT diff = fabs(inizrot - myzrot);
-        RFLOAT flippeddiff = fabs(-inizrot - myzrot);
-        if (flippeddiff < diff) myzrot = -myzrot;
+        // The IMOD .xf 2x2 is a standard rotation matrix [[c,-s],[s,c]] (verified vs IMOD
+        // xfsimplex), so the SIGNED in-plane angle is atan2(A(1,0), A(0,0)). The previous
+        // acos(A(0,0)) recovered only |zrot| and guessed the sign from the nominal tilt-axis
+        // angle; when the .xf rotation sign disagreed with the nominal (an IMOD<->RELION
+        // tilt-axis convention difference) it stored the wrong-sign ZRot and the tomogram
+        // reconstructed badly misaligned. atan2 reads the sign straight from the .xf and is
+        // identical to the old result whenever the old sign heuristic was right.
+        RFLOAT myzrot = RAD2DEG(atan2(A(1, 0), A(0, 0)));
         tomogramSet.tomogramTables[idx_tomo].setValue(EMDL_TOMO_ZROT, myzrot, f);
 
         f++;
