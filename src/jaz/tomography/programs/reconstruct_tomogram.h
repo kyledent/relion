@@ -80,7 +80,8 @@ class TomoBackprojectProgram
             double BfactorPerElectronDose;
             double lambda;
             bool do_gpu;     // GPU real-space WBP (Route B)
-            int gpu_id;      // CUDA device id for the GPU WBP
+            std::vector<int> gpu_ids;  // CUDA devices for --gpu (round-robin over MPI ranks)
+            int my_gpu;      // this rank's CUDA device (set in run())
             int gpu_tile_z;  // output z-slab depth for the GPU WBP (0 = whole volume)
             bool gpu_fast;   // texture + single-precision GPU WBP (faster, ~routeB equiv)
             bool do_dose_weight;  // apply per-tilt Grant&Grigorieff dose weighting (variable exposure)

@@ -131,7 +131,23 @@ void TomoBackprojectProgram::readParameters(int argc, char *argv[])
     taperFalloff = textToDouble(parser.getOption("--tf", "Tapering falloff", "0.0"));
 
     do_gpu = parser.checkOption("--gpu", "Use the GPU for real-space weighted back-projection (Route B)");
-    gpu_id = textToInteger(parser.getOption("--gpu_id", "CUDA device id for --gpu", "0"));
+    {
+        // --gpu_id accepts a single id or a colon-separated list; under MPI the list is
+        // assigned round-robin over ranks, so tomograms spread across multiple GPUs.
+        std::string ids = parser.getOption("--gpu_id", "CUDA device id(s) for --gpu; colon-separated to spread tomograms across GPUs under MPI (e.g. 0:1:2:3)", "0");
+        gpu_ids.clear();
+        size_t pos = 0;
+        while (pos <= ids.size())
+        {
+            size_t col = ids.find(':', pos);
+            std::string tok = (col == std::string::npos) ? ids.substr(pos) : ids.substr(pos, col - pos);
+            if (!tok.empty()) gpu_ids.push_back(textToInteger(tok));
+            if (col == std::string::npos) break;
+            pos = col + 1;
+        }
+        if (gpu_ids.empty()) gpu_ids.push_back(0);
+        my_gpu = gpu_ids[0];
+    }
     gpu_tile_z = textToInteger(parser.getOption("--gpu_tile_z", "GPU output z-slab depth (0 = whole volume; lower = less VRAM)", "0"));
     gpu_fast = parser.checkOption("--gpu_fast", "Faster GPU WBP via texture-memory hardware bilinear + single precision (equivalent to ~routeB FSC tolerance; default --gpu is exact double precision)");
 #ifndef _CUDA_ENABLED
@@ -256,6 +272,10 @@ void TomoBackprojectProgram::run(int rank, int size)
 {
     long my_first_idx, my_last_idx;
     divide_equally(tomoIndexTodo.size(), size, rank , my_first_idx, my_last_idx);
+
+    // pick this rank's GPU from the --gpu_id list (round-robin), so tomograms spread
+    // across GPUs under MPI; a single id means every rank uses the same device.
+    my_gpu = gpu_ids[rank % gpu_ids.size()];
 
     int barstep, nr_todo = my_last_idx-my_first_idx+1;
     if (rank == 0)
@@ -841,7 +861,7 @@ void TomoBackprojectProgram::reconstructOneTomogram(int tomoIndex, bool doEven, 
 			wbpBackprojectGPU(
 					src.data, projRows.data(), fc, src.xdim, src.ydim,
 					dst.xdim, dst.ydim, dst.zdim,
-					orig.x, orig.y, orig.z, spacing, dst.data, gpu_tile_z, gpu_fast, gpu_id);
+					orig.x, orig.y, orig.z, spacing, dst.data, gpu_tile_z, gpu_fast, my_gpu);
 			return;
 		}
 #endif
