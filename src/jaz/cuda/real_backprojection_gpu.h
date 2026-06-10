@@ -28,6 +28,9 @@
 //   tileZ     : output z-slab depth (0 or >=outZ = whole volume in one pass). Tiling
 //               keeps the tilt stack resident and only the output slab on the GPU, so
 //               volumes larger than VRAM still reconstruct.
+//   fast      : false = exact double-precision global-memory gather (bit-equivalent to
+//               the CPU); true = layered-texture hardware-bilinear single-precision
+//               kernel (faster, equivalent only to ~routeB FSC tolerance).
 //   device    : CUDA device id (-1 = leave current)
 //
 // Voxels onto which no frame projects are left at 0 (matches the CPU wgh==0 case
@@ -40,6 +43,7 @@ void wbpBackprojectGPU(
         double ox, double oy, double oz, double spacing,
         float* out,
         int tileZ,
+        bool fast,
         int device);
 
 #endif

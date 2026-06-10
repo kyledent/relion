@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <vector>
 
 #include "src/jaz/cuda/real_backprojection_gpu.h"
 
@@ -85,6 +86,46 @@ __global__ void wbp_backproject_kernel(
 }
 
 
+// Fast variant: single precision + a layered 2D texture with hardware bilinear filtering
+// (one tex fetch replaces 4 global loads + manual interpolation). addressMode=Clamp
+// reproduces linearXY_clip's edge clamping; the in-bounds test on pi is done BEFORE the
+// fetch (as the CPU does). Equivalent to the CPU only to ~routeB FSC tolerance (texture
+// filtering uses 9-bit fractional weights and accumulation is in float).
+__global__ void wbp_backproject_kernel_tex(
+        cudaTextureObject_t tilts,
+        const float* __restrict__ projRows,
+        int fc, int W, int H,
+        int outX, int outY, int zCount, int zBase,
+        float ox, float oy, float oz, float spacing,
+        float* __restrict__ out)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int z = blockIdx.z * blockDim.z + threadIdx.z;
+    if (x >= outX || y >= outY || z >= zCount) return;
+
+    const float pwx = ox + x * spacing;
+    const float pwy = oy + y * spacing;
+    const float pwz = oz + (zBase + z) * spacing;
+
+    float sum = 0.0f, wgh = 0.0f;
+    for (int f = 0; f < fc; ++f)
+    {
+        const float* P = projRows + (size_t) f * 8;
+        const float pix = P[0] * pwx + P[1] * pwy + P[2] * pwz + P[3];
+        const float piy = P[4] * pwx + P[5] * pwy + P[6] * pwz + P[7];
+        if (pix >= 0.0f && pix < W && piy >= 0.0f && piy < H)
+        {
+            // +0.5 -> texel-centre addressing for cudaFilterModeLinear
+            sum += tex2DLayered<float>(tilts, pix + 0.5f, piy + 0.5f, f);
+            wgh += 1.0f;
+        }
+    }
+    if (wgh > 0.0f)
+        out[((size_t) z * outY + y) * outX + x] = sum / wgh;
+}
+
+
 void wbpBackprojectGPU(
         const float*  stack,
         const double* projRows,
@@ -93,6 +134,7 @@ void wbpBackprojectGPU(
         double ox, double oy, double oz, double spacing,
         float* out,
         int tileZ,
+        bool fast,
         int device)
 {
     if (device >= 0) RLN_CUDA_CHECK(cudaSetDevice(device));
@@ -100,41 +142,88 @@ void wbpBackprojectGPU(
     const size_t stackN = (size_t) fc * H * W;
     const size_t projN  = (size_t) fc * 8;
 
-    // The tilt stack + proj rows stay resident; only the output is tiled in z, so a
-    // volume larger than VRAM still fits (one z-slab at a time). tileZ<=0 or >=outZ
-    // means a single slab (whole volume).
+    // Output tiled in z; the tilt stack stays resident, so volumes > VRAM still fit
+    // (one z-slab at a time). tileZ<=0 or >=outZ means a single slab (whole volume).
     const int tz = (tileZ > 0 && tileZ < outZ) ? tileZ : outZ;
     const size_t slabMax = (size_t) outX * outY * tz;
-
-    float*  d_stack = nullptr;
-    double* d_proj  = nullptr;
-    float*  d_out   = nullptr;
-    RLN_CUDA_CHECK(cudaMalloc(&d_stack, stackN  * sizeof(float)));
-    RLN_CUDA_CHECK(cudaMalloc(&d_proj,  projN   * sizeof(double)));
-    RLN_CUDA_CHECK(cudaMalloc(&d_out,   slabMax * sizeof(float)));
-
-    RLN_CUDA_CHECK(cudaMemcpy(d_stack, stack,    stackN * sizeof(float),  cudaMemcpyHostToDevice));
-    RLN_CUDA_CHECK(cudaMemcpy(d_proj,  projRows, projN  * sizeof(double), cudaMemcpyHostToDevice));
-
     const dim3 block(8, 8, 8);
-    for (int z0 = 0; z0 < outZ; z0 += tz)
-    {
-        const int zc = (outZ - z0 < tz) ? (outZ - z0) : tz;
-        const size_t slabN = (size_t) outX * outY * zc;
 
-        RLN_CUDA_CHECK(cudaMemset(d_out, 0, slabN * sizeof(float)));
-        const dim3 grid((outX + block.x - 1) / block.x,
-                        (outY + block.y - 1) / block.y,
-                        (zc   + block.z - 1) / block.z);
-        wbp_backproject_kernel<<<grid, block>>>(
-                d_stack, d_proj, fc, W, H, outX, outY, zc, z0, ox, oy, oz, spacing, d_out);
-        RLN_CUDA_CHECK(cudaGetLastError());
-        RLN_CUDA_CHECK(cudaDeviceSynchronize());
-        RLN_CUDA_CHECK(cudaMemcpy(out + (size_t) z0 * outX * outY, d_out,
-                                  slabN * sizeof(float), cudaMemcpyDeviceToHost));
+    float* d_out = nullptr;
+    RLN_CUDA_CHECK(cudaMalloc(&d_out, slabMax * sizeof(float)));
+
+    if (!fast)
+    {
+        // ---- exact: double precision, global-memory gather ----
+        float*  d_stack = nullptr;
+        double* d_proj  = nullptr;
+        RLN_CUDA_CHECK(cudaMalloc(&d_stack, stackN * sizeof(float)));
+        RLN_CUDA_CHECK(cudaMalloc(&d_proj,  projN  * sizeof(double)));
+        RLN_CUDA_CHECK(cudaMemcpy(d_stack, stack,    stackN * sizeof(float),  cudaMemcpyHostToDevice));
+        RLN_CUDA_CHECK(cudaMemcpy(d_proj,  projRows, projN  * sizeof(double), cudaMemcpyHostToDevice));
+
+        for (int z0 = 0; z0 < outZ; z0 += tz)
+        {
+            const int zc = (outZ - z0 < tz) ? (outZ - z0) : tz;
+            const size_t slabN = (size_t) outX * outY * zc;
+            RLN_CUDA_CHECK(cudaMemset(d_out, 0, slabN * sizeof(float)));
+            const dim3 grid((outX+block.x-1)/block.x, (outY+block.y-1)/block.y, (zc+block.z-1)/block.z);
+            wbp_backproject_kernel<<<grid, block>>>(
+                    d_stack, d_proj, fc, W, H, outX, outY, zc, z0, ox, oy, oz, spacing, d_out);
+            RLN_CUDA_CHECK(cudaGetLastError());
+            RLN_CUDA_CHECK(cudaDeviceSynchronize());
+            RLN_CUDA_CHECK(cudaMemcpy(out + (size_t) z0 * outX * outY, d_out,
+                                      slabN * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+        cudaFree(d_stack);
+        cudaFree(d_proj);
+    }
+    else
+    {
+        // ---- fast: single precision, layered-texture hardware bilinear ----
+        std::vector<float> hproj(projN);
+        for (size_t i = 0; i < projN; ++i) hproj[i] = (float) projRows[i];
+        float* d_proj = nullptr;
+        RLN_CUDA_CHECK(cudaMalloc(&d_proj, projN * sizeof(float)));
+        RLN_CUDA_CHECK(cudaMemcpy(d_proj, hproj.data(), projN * sizeof(float), cudaMemcpyHostToDevice));
+
+        cudaArray_t arr = nullptr;
+        cudaChannelFormatDesc ch = cudaCreateChannelDesc<float>();
+        RLN_CUDA_CHECK(cudaMalloc3DArray(&arr, &ch, make_cudaExtent(W, H, fc), cudaArrayLayered));
+        cudaMemcpy3DParms cp = {};
+        cp.srcPtr   = make_cudaPitchedPtr((void*) stack, W * sizeof(float), W, H);
+        cp.dstArray = arr;
+        cp.extent   = make_cudaExtent(W, H, fc);
+        cp.kind     = cudaMemcpyHostToDevice;
+        RLN_CUDA_CHECK(cudaMemcpy3D(&cp));
+
+        cudaResourceDesc rd = {}; rd.resType = cudaResourceTypeArray; rd.res.array.array = arr;
+        cudaTextureDesc td = {};
+        td.addressMode[0] = cudaAddressModeClamp;   // match linearXY_clip edge clamping
+        td.addressMode[1] = cudaAddressModeClamp;
+        td.filterMode     = cudaFilterModeLinear;   // hardware bilinear
+        td.readMode       = cudaReadModeElementType;
+        td.normalizedCoords = 0;
+        cudaTextureObject_t tex = 0;
+        RLN_CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
+
+        for (int z0 = 0; z0 < outZ; z0 += tz)
+        {
+            const int zc = (outZ - z0 < tz) ? (outZ - z0) : tz;
+            const size_t slabN = (size_t) outX * outY * zc;
+            RLN_CUDA_CHECK(cudaMemset(d_out, 0, slabN * sizeof(float)));
+            const dim3 grid((outX+block.x-1)/block.x, (outY+block.y-1)/block.y, (zc+block.z-1)/block.z);
+            wbp_backproject_kernel_tex<<<grid, block>>>(
+                    tex, d_proj, fc, W, H, outX, outY, zc, z0,
+                    (float) ox, (float) oy, (float) oz, (float) spacing, d_out);
+            RLN_CUDA_CHECK(cudaGetLastError());
+            RLN_CUDA_CHECK(cudaDeviceSynchronize());
+            RLN_CUDA_CHECK(cudaMemcpy(out + (size_t) z0 * outX * outY, d_out,
+                                      slabN * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+        cudaDestroyTextureObject(tex);
+        cudaFreeArray(arr);
+        cudaFree(d_proj);
     }
 
-    cudaFree(d_stack);
-    cudaFree(d_proj);
     cudaFree(d_out);
 }
