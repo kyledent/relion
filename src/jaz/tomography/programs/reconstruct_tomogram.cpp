@@ -122,6 +122,7 @@ void TomoBackprojectProgram::readParameters(int argc, char *argv[])
     FourierCrop = parser.checkOption("--Fc", "Downsample the 2D images by Fourier cropping");
     SNR = textToDouble(parser.getOption("--SNR", "SNR assumed by the Wiener filter", "10"));
 	applyCtf = parser.checkOption("--ctf", "Perform CTF correction");
+    do_dose_weight = parser.checkOption("--dose_weight", "Apply per-tilt Grant & Grigorieff dose weighting (for variable-exposure data; uses --bfactor_per_edose if set)");
     doWiener = !parser.checkOption("--skip_wiener", "Do multiply images with CTF, but don't divide by CTF^2 in Wiener filter");
     if (!doWiener) applyCtf = true;
 
@@ -747,52 +748,68 @@ void TomoBackprojectProgram::reconstructOneTomogram(int tomoIndex, bool doEven, 
 	
 	BufferedImage<float> psfStack;
 
-	if (applyCtf)
+	if (applyCtf || do_dose_weight)
 	{
-		// modulate stackAct with CTF (mind the spacing)
-		
-		psfStack.resize(w_stackAct, h_stackAct, fc);
-		BufferedImage<fComplex> debug(wh_stackAct, h_stackAct, fc);
-		
+		// Per-frame Fourier premultiply: modulate stackAct by the CTF (if --ctf) and/or
+		// the per-tilt Grant & Grigorieff dose-weighting filter (if --dose_weight). Dose
+		// weighting downweights high frequencies more in higher-dose tilts -- essential
+		// for VARIABLE-EXPOSURE data (e.g. ArbitrET 30/3, 50/3). Applied here, BEFORE
+		// back-projection, so it feeds both the CPU and GPU (--gpu) WBP paths unchanged.
+		// The dose-weight convention is identical to Damage::weightImage /
+		// Tomogram::computeDoseWeight (the function reconstruct_particle uses).
+
+		if (applyCtf) psfStack.resize(w_stackAct, h_stackAct, fc);
+
 		#pragma omp parallel for num_threads(n_threads)
 		for (int f = 0; f < fc; f++)
 		{
 			BufferedImage<float> frame = stackAct.getSliceRef(f);
-			
+
 			BufferedImage<fComplex> frameFS;
 			FFT::FourierTransform(frame, frameFS, FFT::Both);
-			
-			CTF ctf = tomogram.centralCTFs[f];
-			
-			
-			BufferedImage<fComplex> ctf2ImageFS(wh_stackAct, h_stackAct);
-			
+
+			CTF ctf;
+			if (applyCtf) ctf = tomogram.centralCTFs[f];
+			const double dose = do_dose_weight ? tomogram.getCumulativeDose(f) : 0.0;
+
+			BufferedImage<fComplex> ctf2ImageFS;
+			if (applyCtf) ctf2ImageFS.resize(wh_stackAct, h_stackAct);
+
 			const double box_size_x = pixelSizeAct * w_stackAct;
 			const double box_size_y = pixelSizeAct * h_stackAct;
-			
+
 			for (int y = 0; y < h_stackAct;  y++)
 			for (int x = 0; x < wh_stackAct; x++)
 			{
 				const double xA = x / box_size_x;
 				const double yA = (y < h_stackAct/2? y : y - h_stackAct) / box_size_y;
-				
-                const float c = ctf.getCTF(xA, yA, false, false,
-                                           true, false, 0.0, false);
 
-				
-				ctf2ImageFS(x,y) = fComplex(c*c,0);
+				float c = 1.0f;
+				if (applyCtf)
+					c = ctf.getCTF(xA, yA, false, false, true, false, 0.0, false);
+
+				if (do_dose_weight)
+				{
+					if (BfactorPerElectronDose > 0.0)
+						c *= (float) exp(-BfactorPerElectronDose * dose / 4.0 * (xA * xA + yA * yA));
+					else
+						c *= (float) Damage::getWeight(dose, sqrt(xA * xA + yA * yA));
+				}
+
+				if (applyCtf) ctf2ImageFS(x,y) = fComplex(c * c, 0);
 				frameFS(x,y) *= c;
 			}
-			
+
 			FFT::inverseFourierTransform(frameFS, frame, FFT::Both);
 			stackAct.getSliceRef(f).copyFrom(frame);
-			
-			FFT::inverseFourierTransform(ctf2ImageFS, frame, FFT::Both);
-			psfStack.getSliceRef(f).copyFrom(frame);
-			
-			debug.getSliceRef(f).copyFrom(ctf2ImageFS);
+
+			if (applyCtf)
+			{
+				FFT::inverseFourierTransform(ctf2ImageFS, frame, FFT::Both);
+				psfStack.getSliceRef(f).copyFrom(frame);
+			}
 		}
-	}	
+	}
 	
 	if (applyPreWeight)
 	{

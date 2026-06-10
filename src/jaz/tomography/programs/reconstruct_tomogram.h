@@ -81,6 +81,7 @@ class TomoBackprojectProgram
             double lambda;
             bool do_gpu;     // GPU real-space WBP (Route B)
             int gpu_id;      // CUDA device id for the GPU WBP
+            bool do_dose_weight;  // apply per-tilt Grant&Grigorieff dose weighting (variable exposure)
 
             std::vector<long> tomoIndexTodo;
 			OptimisationSet optimisationSet;
