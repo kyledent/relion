@@ -132,6 +132,7 @@ void TomoBackprojectProgram::readParameters(int argc, char *argv[])
 
     do_gpu = parser.checkOption("--gpu", "Use the GPU for real-space weighted back-projection (Route B)");
     gpu_id = textToInteger(parser.getOption("--gpu_id", "CUDA device id for --gpu", "0"));
+    gpu_tile_z = textToInteger(parser.getOption("--gpu_tile_z", "GPU output z-slab depth (0 = whole volume; lower = less VRAM)", "0"));
 #ifndef _CUDA_ENABLED
     if (do_gpu)
     {
@@ -839,7 +840,7 @@ void TomoBackprojectProgram::reconstructOneTomogram(int tomoIndex, bool doEven, 
 			wbpBackprojectGPU(
 					src.data, projRows.data(), fc, src.xdim, src.ydim,
 					dst.xdim, dst.ydim, dst.zdim,
-					orig.x, orig.y, orig.z, spacing, dst.data, gpu_id);
+					orig.x, orig.y, orig.z, spacing, dst.data, gpu_tile_z, gpu_id);
 			return;
 		}
 #endif

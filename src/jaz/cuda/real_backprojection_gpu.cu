@@ -32,19 +32,19 @@ __global__ void wbp_backproject_kernel(
         const float*  __restrict__ stack,
         const double* __restrict__ projRows,
         int fc, int W, int H,
-        int outX, int outY, int outZ,
+        int outX, int outY, int zCount, int zBase,
         double ox, double oy, double oz, double spacing,
         float* __restrict__ out)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    const int z = blockIdx.z * blockDim.z + threadIdx.z;
-    if (x >= outX || y >= outY || z >= outZ) return;
+    const int z = blockIdx.z * blockDim.z + threadIdx.z;   // slab-local z in [0,zCount)
+    if (x >= outX || y >= outY || z >= zCount) return;
 
-    // pw = origin + (x,y,z) * spacing   (w = 1)
+    // pw = origin + (x,y, zBase+z) * spacing   (w = 1); zBase = global z of this slab
     const double pwx = ox + x * spacing;
     const double pwy = oy + y * spacing;
-    const double pwz = oz + z * spacing;
+    const double pwz = oz + (zBase + z) * spacing;
 
     double sum = 0.0;
     double wgh = 0.0;
@@ -92,36 +92,47 @@ void wbpBackprojectGPU(
         int outX, int outY, int outZ,
         double ox, double oy, double oz, double spacing,
         float* out,
+        int tileZ,
         int device)
 {
     if (device >= 0) RLN_CUDA_CHECK(cudaSetDevice(device));
 
     const size_t stackN = (size_t) fc * H * W;
     const size_t projN  = (size_t) fc * 8;
-    const size_t outN   = (size_t) outX * outY * outZ;
+
+    // The tilt stack + proj rows stay resident; only the output is tiled in z, so a
+    // volume larger than VRAM still fits (one z-slab at a time). tileZ<=0 or >=outZ
+    // means a single slab (whole volume).
+    const int tz = (tileZ > 0 && tileZ < outZ) ? tileZ : outZ;
+    const size_t slabMax = (size_t) outX * outY * tz;
 
     float*  d_stack = nullptr;
     double* d_proj  = nullptr;
     float*  d_out   = nullptr;
-    RLN_CUDA_CHECK(cudaMalloc(&d_stack, stackN * sizeof(float)));
-    RLN_CUDA_CHECK(cudaMalloc(&d_proj,  projN  * sizeof(double)));
-    RLN_CUDA_CHECK(cudaMalloc(&d_out,   outN   * sizeof(float)));
+    RLN_CUDA_CHECK(cudaMalloc(&d_stack, stackN  * sizeof(float)));
+    RLN_CUDA_CHECK(cudaMalloc(&d_proj,  projN   * sizeof(double)));
+    RLN_CUDA_CHECK(cudaMalloc(&d_out,   slabMax * sizeof(float)));
 
     RLN_CUDA_CHECK(cudaMemcpy(d_stack, stack,    stackN * sizeof(float),  cudaMemcpyHostToDevice));
     RLN_CUDA_CHECK(cudaMemcpy(d_proj,  projRows, projN  * sizeof(double), cudaMemcpyHostToDevice));
-    RLN_CUDA_CHECK(cudaMemset(d_out, 0, outN * sizeof(float)));
 
     const dim3 block(8, 8, 8);
-    const dim3 grid((outX + block.x - 1) / block.x,
-                    (outY + block.y - 1) / block.y,
-                    (outZ + block.z - 1) / block.z);
+    for (int z0 = 0; z0 < outZ; z0 += tz)
+    {
+        const int zc = (outZ - z0 < tz) ? (outZ - z0) : tz;
+        const size_t slabN = (size_t) outX * outY * zc;
 
-    wbp_backproject_kernel<<<grid, block>>>(
-            d_stack, d_proj, fc, W, H, outX, outY, outZ, ox, oy, oz, spacing, d_out);
-
-    RLN_CUDA_CHECK(cudaGetLastError());
-    RLN_CUDA_CHECK(cudaDeviceSynchronize());
-    RLN_CUDA_CHECK(cudaMemcpy(out, d_out, outN * sizeof(float), cudaMemcpyDeviceToHost));
+        RLN_CUDA_CHECK(cudaMemset(d_out, 0, slabN * sizeof(float)));
+        const dim3 grid((outX + block.x - 1) / block.x,
+                        (outY + block.y - 1) / block.y,
+                        (zc   + block.z - 1) / block.z);
+        wbp_backproject_kernel<<<grid, block>>>(
+                d_stack, d_proj, fc, W, H, outX, outY, zc, z0, ox, oy, oz, spacing, d_out);
+        RLN_CUDA_CHECK(cudaGetLastError());
+        RLN_CUDA_CHECK(cudaDeviceSynchronize());
+        RLN_CUDA_CHECK(cudaMemcpy(out + (size_t) z0 * outX * outY, d_out,
+                                  slabN * sizeof(float), cudaMemcpyDeviceToHost));
+    }
 
     cudaFree(d_stack);
     cudaFree(d_proj);

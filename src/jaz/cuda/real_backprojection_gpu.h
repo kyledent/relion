@@ -25,6 +25,9 @@
 //   ox/oy/oz  : reconstruction origin (orig = (x0,y0,z0))
 //   spacing   : output-voxel spacing (binning)
 //   out       : outX*outY*outZ floats (host), filled on return (x fastest)
+//   tileZ     : output z-slab depth (0 or >=outZ = whole volume in one pass). Tiling
+//               keeps the tilt stack resident and only the output slab on the GPU, so
+//               volumes larger than VRAM still reconstruct.
 //   device    : CUDA device id (-1 = leave current)
 //
 // Voxels onto which no frame projects are left at 0 (matches the CPU wgh==0 case
@@ -36,6 +39,7 @@ void wbpBackprojectGPU(
         int outX, int outY, int outZ,
         double ox, double oy, double oz, double spacing,
         float* out,
+        int tileZ,
         int device);
 
 #endif
