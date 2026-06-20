@@ -775,7 +775,7 @@ void TomoBackprojectProgram::reconstructOneTomogram(int tomoIndex, bool doEven, 
 		// Per-frame Fourier premultiply: modulate stackAct by the CTF (if --ctf) and/or
 		// the per-tilt Grant & Grigorieff dose-weighting filter (if --dose_weight). Dose
 		// weighting downweights high frequencies more in higher-dose tilts -- essential
-		// for VARIABLE-EXPOSURE data (e.g. ArbitrET 30/3, 50/3). Applied here, BEFORE
+		// for VARIABLE-EXPOSURE data (e.g. 30/3, 50/3 dose schemes). Applied here, BEFORE
 		// back-projection, so it feeds both the CPU and GPU (--gpu) WBP paths unchanged.
 		// The dose-weight convention is identical to Damage::weightImage /
 		// Tomogram::computeDoseWeight (the function reconstruct_particle uses).
