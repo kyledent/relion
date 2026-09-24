@@ -20,7 +20,7 @@ void getFourierTransformsAndCtfs(long int part_id,
 {
 		GTIC(accMLO->timer,"getFourierTransformsAndCtfs");
 #ifdef TIMING
-	if (part_id == baseMLO->exp_my_first_part_id)
+	if (part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 		baseMLO->timer.tic(baseMLO->TIMING_ESP_FT);
 #endif
 
@@ -1002,7 +1002,7 @@ void getFourierTransformsAndCtfs(long int part_id,
 	} // end loop img_id
 	//accMLO->transformer.clear();
 #ifdef TIMING
-	if (part_id == baseMLO->exp_my_first_part_id)
+	if (part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 		baseMLO->timer.toc(baseMLO->TIMING_ESP_FT);
 #endif
 	GTOC(accMLO->timer,"getFourierTransformsAndCtfs");
@@ -1025,7 +1025,7 @@ void getAllSquaredDifferencesCoarse(
 {
 
 #ifdef TIMING
-	if (op.part_id == baseMLO->exp_my_first_part_id)
+	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 		baseMLO->timer.tic(baseMLO->TIMING_ESP_DIFF1);
 #endif
 
@@ -1408,7 +1408,7 @@ void getAllSquaredDifferencesCoarse(
     //std::cerr << " min_diff2 coarse= " << op.min_diff2 << std::endl;
 
 #ifdef TIMING
-	if (op.part_id == baseMLO->exp_my_first_part_id)
+	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 		baseMLO->timer.toc(baseMLO->TIMING_ESP_DIFF1);
 #endif
 }
@@ -1430,7 +1430,7 @@ void getAllSquaredDifferencesFine(
 	int ibody)
 {
 #ifdef TIMING
-	if (op.part_id == baseMLO->exp_my_first_part_id)
+	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 		baseMLO->timer.tic(baseMLO->TIMING_ESP_DIFF2);
 #endif
 
@@ -1884,7 +1884,7 @@ void getAllSquaredDifferencesFine(
     //std::cerr << "  fine pass minweight  =  " << op.min_diff2 << std::endl;
 
 #ifdef TIMING
-	if (op.part_id == baseMLO->exp_my_first_part_id)
+	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 		baseMLO->timer.toc(baseMLO->TIMING_ESP_DIFF2);
 #endif
 }
@@ -1905,7 +1905,7 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
 											int ibody)
 {
 #ifdef TIMING
-	if (op.part_id == baseMLO->exp_my_first_part_id)
+	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 	{
 		if (exp_ipass == 0) baseMLO->timer.tic(baseMLO->TIMING_ESP_WEIGHT1);
 		else baseMLO->timer.tic(baseMLO->TIMING_ESP_WEIGHT2);
@@ -2539,7 +2539,7 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
     op.significant_weight = (RFLOAT) my_significant_weight;
 
 #ifdef TIMING
-	if (op.part_id == baseMLO->exp_my_first_part_id)
+	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 	{
 		if (exp_ipass == 0) baseMLO->timer.toc(baseMLO->TIMING_ESP_WEIGHT1);
 		else baseMLO->timer.toc(baseMLO->TIMING_ESP_WEIGHT2);
@@ -2561,7 +2561,7 @@ void storeWeightedSums(OptimisationParamters &op, SamplingParameters &sp,
 						int ibody, AccPtrBundle &bundleSWS)
 {
 #ifdef TIMING
-	if (op.part_id == baseMLO->exp_my_first_part_id)
+	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 		baseMLO->timer.tic(baseMLO->TIMING_ESP_WSUM);
 #endif
 	CTIC(accMLO->timer,"store_init");
@@ -3384,7 +3384,7 @@ void storeWeightedSums(OptimisationParamters &op, SamplingParameters &sp,
 						op.local_Minvsigma2.xdim - 1);
 
 	#ifdef TIMING
-				if (op.part_id == baseMLO->exp_my_first_part_id)
+				if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 					baseMLO->timer.tic(baseMLO->TIMING_WSUM_BACKPROJ);
 	#endif
 
@@ -3422,7 +3422,7 @@ void storeWeightedSums(OptimisationParamters &op, SamplingParameters &sp,
 				CTOC(accMLO->timer,"backproject");
 
 	#ifdef TIMING
-				if (op.part_id == baseMLO->exp_my_first_part_id)
+				if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 					baseMLO->timer.toc(baseMLO->TIMING_WSUM_BACKPROJ);
 	#endif
 
@@ -3661,7 +3661,7 @@ void storeWeightedSums(OptimisationParamters &op, SamplingParameters &sp,
 
 	CTOC(accMLO->timer,"store_post_gpu");
 #ifdef TIMING
-	if (op.part_id == baseMLO->exp_my_first_part_id)
+	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
 		baseMLO->timer.toc(baseMLO->TIMING_ESP_WSUM);
 #endif
 }
