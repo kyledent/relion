@@ -1974,6 +1974,15 @@ void MlOptimiser::initialiseGeneral(int rank)
     TIMING_EXTRA1= timer.setNew(" -extra1");
     TIMING_EXTRA2= timer.setNew(" -extra2");
     TIMING_EXTRA3= timer.setNew(" -extra3");
+    TIMING_FT_PRIORS     = timer.setNew(" -  - EOPft: priors and metadata");
+    TIMING_FT_READ       = timer.setNew(" -  - EOPft: image copy");
+    TIMING_FT_UPLOAD     = timer.setNew(" -  - EOPft: upload, translate, norm");
+    TIMING_FT_FFT_NOMASK = timer.setNew(" -  - EOPft: FFT unmasked");
+    TIMING_FT_MASK       = timer.setNew(" -  - EOPft: soft mask");
+    TIMING_FT_FFT_MASK   = timer.setNew(" -  - EOPft: FFT masked");
+    TIMING_FT_POWER      = timer.setNew(" -  - EOPft: power spectrum");
+    TIMING_FT_CTF        = timer.setNew(" -  - EOPft: CTF");
+    TIMING_FT_STORE      = timer.setNew(" -  - EOPft: store");
 
     RCT_1 = timer.setNew(" RcT1_BPrefRecon ");
     RCT_2 = timer.setNew(" RcT2_BroadCast ");
