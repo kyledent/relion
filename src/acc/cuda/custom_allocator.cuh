@@ -18,6 +18,10 @@
 #include "src/macros.h"
 #include "src/error.h"
 #include "src/parallel.h"
+#ifdef TIMING
+#include <atomic>
+#include <chrono>
+#endif
 
 #ifdef CUSTOM_ALLOCATOR_MEMGUARD
 #include "src/acc/cuda/shortcuts.cuh"
@@ -116,6 +120,38 @@ private:
 
 	omp_lock_t mutex;
 
+#ifdef TIMING
+	// Contention counters, TIMING builds only: every thread of the process takes this lock, and
+	// alloc() walks the whole allocation list (querying the ready event of every pending deferred
+	// free) while holding it. Printed per allocator when it is destroyed.
+	std::atomic<long long> stat_wait_ns{0}, stat_hold_ns{0}, stat_locks{0},
+	                       stat_event_queries{0}, stat_list_steps{0};
+
+	class TimedLock
+	{
+		CudaCustomAllocator &a;
+		std::chrono::steady_clock::time_point acquired;
+	public:
+		explicit TimedLock(CudaCustomAllocator &allocator) : a(allocator)
+		{
+			std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+			omp_set_lock(&a.mutex);
+			acquired = std::chrono::steady_clock::now();
+			a.stat_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(acquired - t0).count();
+			a.stat_locks++;
+		}
+		~TimedLock()
+		{
+			a.stat_hold_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - acquired).count();
+			omp_unset_lock(&a.mutex);
+		}
+	};
+#define CCA_LOCK TimedLock ml(*this)
+#else
+#define CCA_LOCK Lock ml(&mutex)
+#endif
+
 
 	//Look for the first suited space
 	Alloc *_getFirstSuitedFree(size_t size)
@@ -159,9 +195,15 @@ private:
 		{
 			curr = next;
 			next = curr->next;
+#ifdef TIMING
+			stat_list_steps++;
+#endif
 
 			if (! curr->free && curr->freeWhenReady && curr->readyEvent != 0)
 			{
+#ifdef TIMING
+				stat_event_queries++;
+#endif
 				cudaError_t e = cudaEventQuery(curr->readyEvent);
 
 				if (e == cudaSuccess)
@@ -477,7 +519,7 @@ public:
 
 	void resize(size_t size)
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		_clear();
 		totalSize = size;
 		_setup();
@@ -486,7 +528,7 @@ public:
 
 	Alloc* alloc(size_t requestedSize)
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 
 		_freeReadyAllocs();
 
@@ -603,9 +645,15 @@ public:
 	~CudaCustomAllocator()
 	{
 		{
-			Lock ml(&mutex);
+			CCA_LOCK;
 			_clear();
 		}
+#ifdef TIMING
+		printf("allocator-stats pid %d: %lld locks, waited %.3f s, held %.3f s, %lld list steps, "
+		       "%lld event queries\n", (int)getpid(), (long long)stat_locks, 1e-9 * stat_wait_ns,
+		       1e-9 * stat_hold_ns, (long long)stat_list_steps, (long long)stat_event_queries);
+		fflush(stdout);
+#endif
 		omp_destroy_lock(&mutex);
 	}
 
@@ -613,56 +661,57 @@ public:
 
 	void free(Alloc* a)
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		_free(a);
 	}
 
 	void syncReadyEvents()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		_syncReadyEvents();
 	}
 
 	void freeReadyAllocs()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		_freeReadyAllocs();
 	}
 
 	size_t getTotalFreeSpace()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		size_t size = _getTotalFreeSpace();
 		return size;
 	}
 
 	size_t getTotalUsedSpace()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		size_t size = _getTotalUsedSpace();
 		return size;
 	}
 
 	size_t getNumberOfAllocs()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		size_t size = _getNumberOfAllocs();
 		return size;
 	}
 
 	size_t getLargestContinuousFreeSpace()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		size_t size = _getLargestContinuousFreeSpace();
 		return size;
 	}
 
 	void printState()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		_printState();
 	}
 };
 //
 
+#undef CCA_LOCK
 #endif
