@@ -1,5 +1,7 @@
 static omp_lock_t global_mutex;
 
+#include "src/acc/acc_operand_dump.h"
+
 #ifdef _SYCL_ENABLED
 #include "src/acc/sycl/sycl_virtual_dev.h"
 using deviceStream_t = virtualSYCL*;
@@ -1187,6 +1189,9 @@ void getAllSquaredDifferencesCoarse(
 	trans_xyz.allAlloc();
 	corr_img.allAlloc();
 
+	// Opt-in operand dump of this pass (acc_operand_dump.h); inert unless RELION_OPERAND_DUMP is set.
+	const bool dumpOperands = OperandDump::dir() != nullptr && OperandDump::claimParticle(baseMLO->iter);
+
     for (unsigned long img_id = 0; img_id < sp.nr_images; img_id++)
 	{
 
@@ -1398,6 +1403,90 @@ void getAllSquaredDifferencesCoarse(
 		}
 	 #endif
 	#endif
+
+#ifdef _CUDA_ENABLED
+		if (dumpOperands)
+		{
+			// Everything the coarse kernel read for this image, and the diff2 it returned (as
+			// accumulated in allWeights, which also carries highres_Xi2/2 unless do_CC).
+			std::ostringstream name;
+			name << "coarse_it" << baseMLO->iter << "_part" << op.part_id << "_img" << img_id;
+			OperandDump::Writer w(name.str());
+			w.value("iter", baseMLO->iter).value("part_id", op.part_id).value("img_id", img_id)
+			 .value("nr_images", sp.nr_images).value("ipass", exp_ipass)
+			 .value("current_oversampling", sp.current_oversampling)
+			 .value("image_size", image_size).value("xdim", op.local_Minvsigma2.xdim)
+			 .value("ydim", op.local_Minvsigma2.ydim).value("zdim", op.local_Minvsigma2.zdim)
+			 .value("translation_num", translation_num).value("do_CC", do_CC)
+			 .value("is_tomo", op.is_tomo).value("data_is_3D", accMLO->dataIs3D)
+			 .value("shifts_is_3D", accMLO->shiftsIs3D)
+			 .value("do_ctf_correction", baseMLO->do_ctf_correction)
+			 .value("refs_are_ctf_corrected", baseMLO->refs_are_ctf_corrected)
+			 .value("ctf_premultiplied", baseMLO->mydata.obsModel.getCtfPremultiplied(optics_group))
+			 .value("do_scale_correction", baseMLO->do_scale_correction)
+			 .value("scale_correction", baseMLO->mymodel.scale_correction[group_id])
+			 .value("highres_Xi2", op.highres_Xi2_img[img_id])
+			 .value("sqrtXi2", op.local_sqrtXi2[img_id])
+			 .value("pixel_size", my_pixel_size)
+			 .value("image_full_size", baseMLO->image_full_size[optics_group])
+			 .value("iclass_min", sp.iclass_min).value("iclass_max", sp.iclass_max)
+			 .value("xfloat_bytes", sizeof(XFLOAT));
+			w.array("Fimg_kernel", &Fimg_[0], (size_t)image_size * 2)      // re block, then im block
+			 .array("corr_img", &corr_img[0], (size_t)image_size)           // the kernel uses corr/2
+			 .array("trans_xyz", &trans_xyz[0], (size_t)translation_num * 3) // x block, y, z
+			 .array("Fimg_raw", reinterpret_cast<const RFLOAT *>(Fimg.data), (size_t)image_size * 2)
+			 .array("Fctf", op.local_Fctf[img_id].data, (size_t)image_size)
+			 .array("Minvsigma2", op.local_Minvsigma2.data, (size_t)image_size);
+
+			std::vector<XFLOAT> hostWeights(allWeights.getSize());
+			DEBUG_HANDLE_ERROR(cudaMemcpy(hostWeights.data(), ~allWeights,
+					hostWeights.size() * sizeof(XFLOAT), cudaMemcpyDeviceToHost));
+			for (unsigned long iclass = sp.iclass_min, pos = 0; iclass <= sp.iclass_max; iclass++)
+			{
+				AccProjectorPlan &plan = projectorPlans[iclass*sp.nr_images + img_id];
+				if (plan.orientation_num <= 0)
+					continue;
+				int iproj = (baseMLO->mymodel.nr_bodies > 1) ? ibody : iclass;
+				AccProjectorKernel k = AccProjectorKernel::makeKernel(accMLO->bundle->projectors[iproj],
+						op.local_Minvsigma2.xdim, op.local_Minvsigma2.ydim,
+						op.local_Minvsigma2.zdim, op.local_Minvsigma2.xdim-1);
+				std::vector<XFLOAT> eulers(plan.orientation_num * 9);
+				DEBUG_HANDLE_ERROR(cudaMemcpy(eulers.data(), ~plan.eulers,
+						eulers.size() * sizeof(XFLOAT), cudaMemcpyDeviceToHost));
+				std::string c = "_c" + std::to_string(iclass);
+				w.value(("orientation_num" + c).c_str(), plan.orientation_num)
+				 .value(("proj_mdlX" + c).c_str(), k.mdlX)
+				 .value(("proj_mdlY" + c).c_str(), k.mdlXY / k.mdlX)
+				 .value(("proj_mdlZ" + c).c_str(), k.mdlZ)
+				 .value(("proj_mdlInitY" + c).c_str(), k.mdlInitY)
+				 .value(("proj_mdlInitZ" + c).c_str(), k.mdlInitZ)
+				 .value(("proj_maxR" + c).c_str(), k.maxR)
+				 .value(("proj_maxR2_padded" + c).c_str(), k.maxR2_padded)
+				 .value(("proj_padding_factor" + c).c_str(), k.padding_factor)
+				 .value(("proj_imgX" + c).c_str(), k.imgX)
+				 .value(("proj_imgY" + c).c_str(), k.imgY)
+				 .value(("proj_imgZ" + c).c_str(), k.imgZ);
+				w.array(("eulers" + c).c_str(), eulers.data(), eulers.size())
+				 .array(("diff2" + c).c_str(), hostWeights.data() + pos,
+						(size_t)plan.orientation_num * translation_num);
+				pos += (size_t)plan.orientation_num * translation_num;
+
+				if (OperandDump::claimModel(baseMLO->iter, iproj))
+				{
+					const Projector &P = baseMLO->mymodel.PPref[iproj];
+					std::ostringstream mname;
+					mname << "model_it" << baseMLO->iter << "_class" << iproj;
+					OperandDump::Writer m(mname.str());
+					m.value("iter", baseMLO->iter).value("iclass", iproj)
+					 .value("xdim", P.data.xdim).value("ydim", P.data.ydim).value("zdim", P.data.zdim)
+					 .value("yinit", P.data.yinit).value("zinit", P.data.zinit)
+					 .value("r_max", P.r_max).value("padding_factor", P.padding_factor)
+					 .value("ori_size", P.ori_size).value("ref_dim", P.ref_dim)
+					 .array("data", reinterpret_cast<const RFLOAT *>(P.data.data), (size_t)P.data.nzyxdim * 2);
+				}
+			}
+		}
+#endif
 
 	} // end loop img_id
 
