@@ -2,6 +2,39 @@ static omp_lock_t global_mutex;
 
 #include "src/acc/acc_operand_dump.h"
 
+#ifdef CC_WEIGHTS_SELFCHECK
+// Self-check of the CC coarse significance, built only with -DCC_WEIGHTS_SELFCHECK: repeat the
+// original host copy of the weights and its threshold loop over the scored entries, and count any
+// entry whose significance differs from what was set. Each process prints its totals at exit.
+#include <atomic>
+#include <unistd.h>
+struct CcWeightsSelfcheckTotals
+{
+	std::atomic<long long> calls{0}, entries{0}, mismatches{0};
+	~CcWeightsSelfcheckTotals()
+	{
+		if (calls > 0)
+			printf("cc-weights-selfcheck pid %d: %lld particles, %lld entries, %lld differ from the original loop\n",
+			       (int)getpid(), (long long)calls, (long long)entries, (long long)mismatches);
+		fflush(stdout);
+	}
+};
+static CcWeightsSelfcheckTotals cc_weights_selfcheck_totals;
+
+static void cc_weights_selfcheck(AccPtr<XFLOAT> &weights, MultidimArray<bool> &significant, XFLOAT threshold)
+{
+	weights.cpToHost();
+	weights.streamSync();
+	long long bad = 0;
+	for (size_t i = 0; i < weights.getSize(); i++)
+		if ((weights[i] >= threshold) != DIRECT_A1D_ELEM(significant, i))
+			bad++;
+	cc_weights_selfcheck_totals.calls++;
+	cc_weights_selfcheck_totals.entries += (long long)weights.getSize();
+	cc_weights_selfcheck_totals.mismatches += bad;
+}
+#endif
+
 // Sub-steps of getFourierTransformsAndCtfs, timed under TIMING for the first particle of each batch,
 // like the phases around them. A step's stop first synchronises this thread's stream, so GPU work is
 // counted in the step that queued it rather than in whichever later step happens to wait for it.
@@ -2150,12 +2183,20 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
         }
 
         std::pair<size_t, XFLOAT> min_pair=AccUtilities::getArgMinOnDevice<XFLOAT>(PassWeights.weights);
+#if defined(_CUDA_ENABLED) || defined(_HIP_ENABLED)
+        // In the coarse pass the host copies of the weights feed only the significance loop below,
+        // and that loop's answer is already known: the one entry at min_pair.first. So neither
+        // copy is made for it; the fine pass keeps them.
+        if (exp_ipass != 0)
+#endif
+        {
         PassWeights.weights.cpToHost();
 #ifdef _HIP_ENABLED
         DEBUG_HANDLE_ERROR(hipStreamSynchronize(hipStreamPerThread));
 #else
         DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
 #endif
+        }
 
         // This gives the non-reproducible results with oversampling==0 and do_firstiter_cc....
         //if (exp_ipass==0)
@@ -2169,16 +2210,26 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
         XFLOAT unity=1;
         DEBUG_HANDLE_ERROR(cudaMemcpyAsync( &(PassWeights.weights(min_pair.first) ), &unity, sizeof(XFLOAT), cudaMemcpyHostToDevice, 0));
 
-        PassWeights.weights.cpToHost();
-        DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
+        if (exp_ipass != 0)
+        {
+            PassWeights.weights.cpToHost();
+            DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
+        }
+        else  // the unity copy reads a stack variable: finish it before leaving its scope
+            DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
 #elif _HIP_ENABLED
         DEBUG_HANDLE_ERROR(hipMemsetAsync(~(PassWeights.weights), 0.f, PassWeights.weights.getSize()*sizeof(XFLOAT),0));
 
         XFLOAT unity=1;
         DEBUG_HANDLE_ERROR(hipMemcpyAsync( &(PassWeights.weights(min_pair.first) ), &unity, sizeof(XFLOAT), hipMemcpyHostToDevice, 0));
 
-        PassWeights.weights.cpToHost();
-        DEBUG_HANDLE_ERROR(hipStreamSynchronize(hipStreamPerThread));
+        if (exp_ipass != 0)
+        {
+            PassWeights.weights.cpToHost();
+            DEBUG_HANDLE_ERROR(hipStreamSynchronize(hipStreamPerThread));
+        }
+        else  // the unity copy reads a stack variable: finish it before leaving its scope
+            DEBUG_HANDLE_ERROR(hipStreamSynchronize(hipStreamPerThread));
 #elif defined(_SYCL_ENABLED) && defined(USE_ONEDPL)
 		deviceInitValue<XFLOAT>(PassWeights.weights, (XFLOAT)0.0);
 		PassWeights.weights.setAccValueAt((XFLOAT)1.0, min_pair.first);
@@ -2192,12 +2243,17 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
 
         my_significant_weight = 0.999;
         DIRECT_A2D_ELEM(baseMLO->exp_metadata, op.metadata_offset, METADATA_NR_SIGN) = (RFLOAT) 1.;
-        if (exp_ipass==0) // TODO better memset, 0 => false , 1 => true
-            for (int ihidden = 0; ihidden < XSIZE(op.Mcoarse_significant); ihidden++)
-                if (DIRECT_A1D_ELEM(op.Mweight, ihidden) >= my_significant_weight)
-                    DIRECT_A1D_ELEM(op.Mcoarse_significant, ihidden) = true;
-                else
-                    DIRECT_A1D_ELEM(op.Mcoarse_significant, ihidden) = false;
+        if (exp_ipass==0)
+        {
+            // The weights are all zero except a one at min_pair.first, so that is the only
+            // significant sample. (The loop this replaces also read the entries of the classes not
+            // scored in this pass, which were never written; nothing reads them.)
+            memset(op.Mcoarse_significant.data, 0, XSIZE(op.Mcoarse_significant) * sizeof(bool));
+            DIRECT_A1D_ELEM(op.Mcoarse_significant, min_pair.first) = true;
+#ifdef CC_WEIGHTS_SELFCHECK
+            cc_weights_selfcheck(PassWeights.weights, op.Mcoarse_significant, my_significant_weight);
+#endif
+        }
         else
         {
             std::pair<size_t, XFLOAT> max_pair = AccUtilities::getArgMaxOnDevice<XFLOAT>(PassWeights.weights);
