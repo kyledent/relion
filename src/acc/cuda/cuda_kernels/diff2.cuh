@@ -460,6 +460,204 @@ __global__ void cuda_kernel_diff2_CC_coarse(
 #endif
 }
 
+/*
+ * The same scores as cuda_kernel_diff2_CC_coarse, bit for bit, with each orientation's projection
+ * and norm computed once for a chunk of translations instead of once per translation.
+ *
+ * cuda_kernel_diff2_CC_coarse runs one block per (orientation, translation). Every block projects
+ * the reference for every pixel and accumulates the reference's norm, although neither depends on
+ * the translation, so a particle with T translations projects each orientation T times. Here one
+ * block takes an orientation and up to CC_TRANS_CHUNK translations: it projects each pixel once,
+ * accumulates the norm once, and keeps one running sum per translation.
+ *
+ * Kept identical to the original, so the scores are too:
+ *  - each thread visits the same pixels in the same order, with the same projection, translation
+ *    and expressions, so every per-thread sum is formed by the same operations;
+ *  - each sum goes through the same shared-memory tree reduction;
+ *  - the original has all block_sz threads atomically add the same term, which is why the term is
+ *    divided by block_sz. Those block_sz adds onto the existing value are replayed here in order by
+ *    one thread, with round-to-nearest adds that flush subnormals as the hardware's float
+ *    atomicAdd does. One block per (orientation, chunk) writes each value, so nothing else touches
+ *    it during the launch.
+ */
+#ifndef CC_TRANS_CHUNK
+#define CC_TRANS_CHUNK 32
+#endif
+
+#ifdef ACC_DOUBLE_PRECISION
+__device__ __forceinline__ XFLOAT cc_replayed_atomic_sum(XFLOAT base, XFLOAT term, int n)
+{
+	for (int i = 0; i < n; i++)
+		base = __dadd_rn(base, term);
+	return base;
+}
+#else
+__device__ __forceinline__ float cc_flush_subnormal(float v)
+{
+	return (fabsf(v) < 1.17549435e-38f) ? copysignf(0.0f, v) : v;
+}
+
+__device__ __forceinline__ float cc_replayed_atomic_sum(float base, float term, int n)
+{
+	term = cc_flush_subnormal(term);
+	for (int i = 0; i < n; i++)
+		base = cc_flush_subnormal(__fadd_rn(cc_flush_subnormal(base), term));
+	return base;
+}
+#endif
+
+template<bool REF3D, bool DATA3D, int block_sz>
+__global__ void cuda_kernel_diff2_CC_coarse_projected_once(
+		XFLOAT *g_eulers,
+		XFLOAT *g_imgs_real,
+		XFLOAT *g_imgs_imag,
+		XFLOAT *g_trans_x,
+		XFLOAT *g_trans_y,
+		XFLOAT *g_trans_z,
+		AccProjectorKernel projector,
+		XFLOAT *g_corr_img,
+		XFLOAT *g_diff2s,
+		unsigned translation_num,
+		int image_size,
+		XFLOAT exp_local_sqrtXi2
+		)
+{
+	int iorient = blockIdx.x;
+	int trans0 = blockIdx.y * CC_TRANS_CHUNK;
+	int tid = threadIdx.x;
+
+	__shared__ XFLOAT s_weight[block_sz];
+	__shared__ XFLOAT s_norm[block_sz];
+
+	XFLOAT weight[CC_TRANS_CHUNK];
+#pragma unroll
+	for (int t = 0; t < CC_TRANS_CHUNK; t++)
+		weight[t] = (XFLOAT)0.0;
+	XFLOAT norm = (XFLOAT)0.0;
+
+	XFLOAT real, imag, ref_real, ref_imag;
+
+	XFLOAT e0,e1,e2,e3,e4,e5,e6,e7,e8;
+	e0 = __ldg(&g_eulers[iorient*9  ]);
+	e1 = __ldg(&g_eulers[iorient*9+1]);
+	e2 = __ldg(&g_eulers[iorient*9+2]);
+	e3 = __ldg(&g_eulers[iorient*9+3]);
+	e4 = __ldg(&g_eulers[iorient*9+4]);
+	e5 = __ldg(&g_eulers[iorient*9+5]);
+	e6 = __ldg(&g_eulers[iorient*9+6]);
+	e7 = __ldg(&g_eulers[iorient*9+7]);
+	e8 = __ldg(&g_eulers[iorient*9+8]);
+
+	unsigned pixel_pass_num( ceilfracf(image_size,block_sz) );
+	for (unsigned pass = 0; pass < pixel_pass_num; pass++)
+	{
+		unsigned pixel = (pass * block_sz) + tid;
+
+		if(pixel < image_size)
+		{
+			int x,y,z,xy;
+			if(DATA3D)
+			{
+				z =  floorfracf(pixel, projector.imgX*projector.imgY);
+				xy = pixel % (projector.imgX*projector.imgY);
+				x =             xy  % projector.imgX;
+				y = floorfracf( xy,   projector.imgX);
+				if (z > projector.maxR)
+				{
+					if (z >= projector.imgZ - projector.maxR)
+						z = z - projector.imgZ;
+					else
+						x = projector.maxR;
+				}
+			}
+			else
+			{
+				x =             pixel % projector.imgX;
+				y = floorfracf( pixel , projector.imgX);
+			}
+			if (y > projector.maxR)
+			{
+				if (y >= projector.imgY - projector.maxR)
+					y = y - projector.imgY;
+				else
+					x = projector.maxR;
+			}
+
+			if(DATA3D)
+				projector.project3Dmodel(
+					x,y,z,
+					e0,e1,e2,e3,e4,e5,e6,e7,e8,
+					ref_real, ref_imag);
+			else if(REF3D)
+				projector.project3Dmodel(
+					x,y,
+					e0,e1,e3,e4,e6,e7,
+					ref_real, ref_imag);
+			else
+				projector.project2Dmodel(
+					x,y,
+					e0,e1,e3,e4,
+					ref_real, ref_imag);
+
+			norm += (ref_real * ref_real + ref_imag * ref_imag ) * __ldg(&g_corr_img[pixel]);
+
+#pragma unroll
+			for (int t = 0; t < CC_TRANS_CHUNK; t++)
+			{
+				int itrans = trans0 + t;
+				if (itrans < translation_num)
+				{
+					if(DATA3D)
+						translatePixel(x, y, z, g_trans_x[itrans], g_trans_y[itrans], g_trans_z[itrans], g_imgs_real[pixel], g_imgs_imag[pixel], real, imag);
+					else
+						translatePixel(x, y,    g_trans_x[itrans], g_trans_y[itrans],                    g_imgs_real[pixel], g_imgs_imag[pixel], real, imag);
+
+					weight[t] += (ref_real * real     + ref_imag * imag)      * __ldg(&g_corr_img[pixel]);
+				}
+			}
+		}
+	}
+
+	// The norm: the original's tree reduction, once.
+	s_norm[tid] = norm;
+	__syncthreads();
+	for(int j=(block_sz/2); j>0; j/=2)
+	{
+		if(tid<j)
+			s_norm[tid] += s_norm[tid+j];
+		__syncthreads();
+	}
+	const XFLOAT block_norm = s_norm[0];
+
+	// Each translation: the original's tree reduction, then its block_sz atomic adds, replayed.
+#pragma unroll
+	for (int t = 0; t < CC_TRANS_CHUNK; t++)
+	{
+		int itrans = trans0 + t;
+		if (itrans >= translation_num)
+			break;
+		s_weight[tid] = weight[t];
+		__syncthreads();
+		for(int j=(block_sz/2); j>0; j/=2)
+		{
+			if(tid<j)
+				s_weight[tid] += s_weight[tid+j];
+			__syncthreads();
+		}
+		if (tid == 0)
+		{
+#ifdef ACC_DOUBLE_PRECISION
+			const XFLOAT term = - ( s_weight[0] / (block_sz * sqrt(block_norm)));
+#else
+			const XFLOAT term = - ( s_weight[0] / (block_sz * sqrtf(block_norm)));
+#endif
+			XFLOAT *out = &g_diff2s[iorient * translation_num + itrans];
+			*out = cc_replayed_atomic_sum(*out, term, block_sz);
+		}
+		__syncthreads();
+	}
+}
+
 template<bool REF3D, bool DATA3D, int block_sz,int chunk_sz>
 __global__ void cuda_kernel_diff2_CC_fine(
 		XFLOAT *g_eulers,
