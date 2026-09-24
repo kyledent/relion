@@ -29,6 +29,8 @@
 #include "src/euler.h"
 #include "src/transformations.h"
 #include "src/helix.h"
+#include <memory>
+#include <mutex>
 
 // For the angular searches
 #define NOPRIOR 0
@@ -410,7 +412,40 @@ private:
 												 std::vector <Matrix1D<RFLOAT> >  &sampling_points_vector);
 
 
+private:
+    /* The particle-independent part of selectOrientationsWithNonZeroPriorProbability: the unit
+     * vector of every direction and its image under every symmetry operator. Every particle's
+     * call needs them, so they are computed once for the current tables and reused. */
+    struct DirectionCache
+    {
+        std::vector<RFLOAT> rot, tilt;                  // the tables it was built from ...
+        std::vector <Matrix2D<RFLOAT> > R, L;           // ... and the symmetry operators
+        std::vector <Matrix1D<RFLOAT> > dir;            // [idir]
+        std::vector <Matrix1D<RFLOAT> > sym;            // [idir * R.size() + j]
+    };
 
+    /* Threads share one sampling object in the expectation step, so the cache is an immutable
+     * snapshot behind a shared pointer: a call takes the current one under the mutex and reads it
+     * without a lock, and a rebuild swaps in a new one. A copied sampling object starts empty. */
+    class DirectionCacheHolder
+    {
+    public:
+        std::mutex mutex;
+        std::shared_ptr<const DirectionCache> cache;
+        DirectionCacheHolder() {}
+        DirectionCacheHolder(const DirectionCacheHolder &) {}
+        DirectionCacheHolder &operator=(const DirectionCacheHolder &)
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            cache.reset();
+            return *this;
+        }
+    };
+    DirectionCacheHolder direction_cache;
+
+    // The cache for the current rot_angles, tilt_angles and symmetry operators, (re)built if any
+    // of them differ, bit for bit, from what it was built from.
+    std::shared_ptr<const DirectionCache> directionCache();
 };
 //@}
 #endif
