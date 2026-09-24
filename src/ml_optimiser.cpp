@@ -9895,8 +9895,11 @@ void MlOptimiser::updateAngularSampling(bool myverb)
                 }
 
                 // B. Use twice as fine angular sampling
-                int new_hp_order;
-                RFLOAT new_rottilt_step, new_psi_step;
+                // Start from the current sampling: gradient-driven runs may keep it (below), and the
+                // test for local searches further down must then see the current order.
+                int new_hp_order = sampling.healpix_order;
+                RFLOAT new_rottilt_step = 360. / (6 * ROUND(std::pow(2., new_hp_order + adaptive_oversampling)));
+                RFLOAT new_psi_step = new_rottilt_step;
                 // For gradient-driven classifications/initial model calculations: don't go to samplings that require local searches!
                 if (mymodel.ref_dim == 3)
                 {
