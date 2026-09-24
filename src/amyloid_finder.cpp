@@ -89,6 +89,10 @@ void AmyloidFinder::usage()
 
 void AmyloidFinder::initialise(bool is_leader)
 {
+#ifdef TIMING
+    TIMING_A5 = timer.setNew("calculateFOMOneMicrograph");
+#endif
+
     // Make sure fn_odir ends with a slash
     if (fn_odir[fn_odir.length()-1] != '/')
         fn_odir += "/";
