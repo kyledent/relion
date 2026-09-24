@@ -363,6 +363,14 @@ private:
 #endif
 
 		a->free = true;
+		// An exact-size alloc() hands this object out again as it is, so clear the state of the
+		// deferred free too; left set, _freeReadyAllocs() would free the block under its next owner.
+		a->freeWhenReady = false;
+		if (a->readyEvent != 0)
+		{
+			DEBUG_HANDLE_ERROR(cudaEventDestroy(a->readyEvent));
+			a->readyEvent = 0;
+		}
 
 		if (cache)
 		{
