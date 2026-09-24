@@ -2,6 +2,24 @@ static omp_lock_t global_mutex;
 
 #include "src/acc/acc_operand_dump.h"
 
+// Sub-steps of getFourierTransformsAndCtfs, timed under TIMING for the first particle of each batch,
+// like the phases around them. A step's stop first synchronises this thread's stream, so GPU work is
+// counted in the step that queued it rather than in whichever later step happens to wait for it.
+#ifdef TIMING
+#if defined(_CUDA_ENABLED)
+#define FT_STEP_SYNC() DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread))
+#elif defined(_HIP_ENABLED)
+#define FT_STEP_SYNC() DEBUG_HANDLE_ERROR(hipStreamSynchronize(hipStreamPerThread))
+#else
+#define FT_STEP_SYNC()
+#endif
+#define FT_STEP_TIC(tag) do { if (ftTimed) baseMLO->timer.tic(baseMLO->tag); } while (0)
+#define FT_STEP_TOC(tag) do { if (ftTimed) { FT_STEP_SYNC(); baseMLO->timer.toc(baseMLO->tag); } } while (0)
+#else
+#define FT_STEP_TIC(tag) do { } while (0)
+#define FT_STEP_TOC(tag) do { } while (0)
+#endif
+
 #ifdef _SYCL_ENABLED
 #include "src/acc/sycl/sycl_virtual_dev.h"
 using deviceStream_t = virtualSYCL*;
@@ -22,9 +40,11 @@ void getFourierTransformsAndCtfs(long int part_id,
 {
 		GTIC(accMLO->timer,"getFourierTransformsAndCtfs");
 #ifdef TIMING
-	if (part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+	const bool ftTimed = part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id];
+	if (ftTimed)
 		baseMLO->timer.tic(baseMLO->TIMING_ESP_FT);
 #endif
+	FT_STEP_TIC(TIMING_FT_PRIORS);
 
 	CUSTOM_ALLOCATOR_REGION_NAME("GFTCTF");
     Matrix2D<RFLOAT> Aori;
@@ -241,6 +261,8 @@ void getFourierTransformsAndCtfs(long int part_id,
     int optics_group = baseMLO->mydata.getOpticsGroup(part_id);
     bool ctf_premultiplied = baseMLO->mydata.obsModel.getCtfPremultiplied(optics_group);
 
+    FT_STEP_TOC(TIMING_FT_PRIORS);
+    FT_STEP_TIC(TIMING_FT_READ);
     FileName fn_img;
     Image<RFLOAT> img, rec_img;
     if (!baseMLO->mydata.getImageNameOnScratch(part_id, fn_img))
@@ -328,10 +350,12 @@ void getFourierTransformsAndCtfs(long int part_id,
 
     MultidimArray<RFLOAT> wholestack;
     if (op.is_tomo) wholestack=img();
+    FT_STEP_TOC(TIMING_FT_READ);
 
     for (int img_id = 0; img_id < sp.nr_images; img_id++)
 	{
 		CTIC(accMLO->timer,"init");
+		FT_STEP_TIC(TIMING_FT_UPLOAD);
 		MultidimArray<Complex > Fimg;
 		MultidimArray<Complex > Faux;
 		MultidimArray<RFLOAT> Fctf, FstMulti;
@@ -487,6 +511,8 @@ void getFourierTransformsAndCtfs(long int part_id,
             }
         }
 
+        FT_STEP_TOC(TIMING_FT_UPLOAD);
+        FT_STEP_TIC(TIMING_FT_FFT_NOMASK);
         if(baseMLO->has_converged && baseMLO->do_use_reconstruct_images)
         {
 
@@ -542,6 +568,7 @@ void getFourierTransformsAndCtfs(long int part_id,
         CTOC(accMLO->timer,"selfApplyBeamTilt");
 
         op.Fimg_nomask.at(img_id) = Fimg;
+        FT_STEP_TOC(TIMING_FT_FFT_NOMASK);
 
         // ------------------------------------------------------------------------------------------
 
@@ -558,6 +585,7 @@ void getFourierTransformsAndCtfs(long int part_id,
         // We are now done with the unmasked image used for reconstruction.
         // Now make the masked image used for alignment and classification.
 
+        FT_STEP_TIC(TIMING_FT_MASK);
         if (is_helical_segment)
         {
             CTIC(accMLO->timer,"applyHelicalMask");
@@ -682,6 +710,8 @@ void getFourierTransformsAndCtfs(long int part_id,
 
         // ------------------------------------------------------------------------------------------
 
+        FT_STEP_TOC(TIMING_FT_MASK);
+        FT_STEP_TIC(TIMING_FT_FFT_MASK);
 #ifdef _HIP_ENABLED
         CTIC(hipMLO->timer,"normalizeAndTransform");
 #else
@@ -703,6 +733,8 @@ void getFourierTransformsAndCtfs(long int part_id,
 
         // ------------------------------------------------------------------------------------------
 
+        FT_STEP_TOC(TIMING_FT_FFT_MASK);
+        FT_STEP_TIC(TIMING_FT_POWER);
         CTIC(accMLO->timer,"powerClass");
         // Store the power_class spectrum of the whole image (to fill sigma2_noise between current_size and full_size
         if (baseMLO->image_current_size[optics_group] < baseMLO->image_full_size[optics_group])
@@ -772,6 +804,8 @@ void getFourierTransformsAndCtfs(long int part_id,
 		}
 		CTOC(accMLO->timer,"powerClass");
 
+		FT_STEP_TOC(TIMING_FT_POWER);
+		FT_STEP_TIC(TIMING_FT_CTF);
 		Fctf.resize(Fimg);
 		// Now calculate the actual CTF
 		if (baseMLO->do_ctf_correction)
@@ -856,6 +890,8 @@ void getFourierTransformsAndCtfs(long int part_id,
 			Fctf.initConstant(1.);
 		}
 		CTOC(accMLO->timer,"ctfCorr");
+		FT_STEP_TOC(TIMING_FT_CTF);
+		FT_STEP_TIC(TIMING_FT_STORE);
 
 		CTIC(accMLO->timer,"selfApplyBeamTilt");
 		baseMLO->mydata.obsModel.demodulatePhase(optics_group, Fimg);
@@ -1001,6 +1037,7 @@ void getFourierTransformsAndCtfs(long int part_id,
 		} // end if mymodel.nr_bodies > 1
 
 
+		FT_STEP_TOC(TIMING_FT_STORE);
 	} // end loop img_id
 	//accMLO->transformer.clear();
 #ifdef TIMING
