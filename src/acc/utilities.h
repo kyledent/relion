@@ -1159,6 +1159,85 @@ void diff2_coarse(
 #endif
 }
 
+#if defined(_CUDA_ENABLED) && defined(CC_COARSE_SELFCHECK)
+// Self-check of cuda_kernel_diff2_CC_coarse_projected_once, built only with -DCC_COARSE_SELFCHECK:
+// every call also runs the original kernel on a copy of the scores, and the two results are
+// compared bit for bit. Each process prints its totals when it exits.
+#include <atomic>
+#include <cstdio>
+#include <unistd.h>
+
+// static: this header is included by several translation units.
+static __global__ void cc_selfcheck_compare_kernel(const XFLOAT *a, const XFLOAT *b, size_t n,
+		unsigned long long *mismatches, unsigned long long *first)
+{
+	for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+	{
+#ifdef ACC_DOUBLE_PRECISION
+		const bool differ = __double_as_longlong(a[i]) != __double_as_longlong(b[i]);
+#else
+		const bool differ = __float_as_uint(a[i]) != __float_as_uint(b[i]);
+#endif
+		if (differ)
+		{
+			atomicAdd(mismatches, 1ULL);
+			atomicMin(first, (unsigned long long)i);
+		}
+	}
+}
+
+struct CcSelfcheckTotals
+{
+	std::atomic<long long> calls{0}, values{0}, mismatches{0};
+	~CcSelfcheckTotals()
+	{
+		if (calls > 0)
+			printf("cc-selfcheck pid %d: %lld calls, %lld scores, %lld differ bitwise from the original kernel\n",
+			       (int)getpid(), (long long)calls, (long long)values, (long long)mismatches);
+		fflush(stdout);
+	}
+};
+static CcSelfcheckTotals cc_selfcheck_totals;
+
+static void cc_selfcheck(const XFLOAT *reference, const XFLOAT *result, size_t n, cudaStream_t stream)
+{
+	static thread_local unsigned long long *d_counts = nullptr;
+	if (d_counts == nullptr)
+		HANDLE_ERROR(cudaMalloc(&d_counts, 2 * sizeof(unsigned long long)));
+	unsigned long long h[2] = {0ULL, ~0ULL};
+	HANDLE_ERROR(cudaMemcpyAsync(d_counts, h, sizeof(h), cudaMemcpyHostToDevice, stream));
+	cc_selfcheck_compare_kernel<<<256, 256, 0, stream>>>(reference, result, n, d_counts, d_counts + 1);
+	HANDLE_ERROR(cudaMemcpyAsync(h, d_counts, sizeof(h), cudaMemcpyDeviceToHost, stream));
+	HANDLE_ERROR(cudaStreamSynchronize(stream));
+	cc_selfcheck_totals.calls++;
+	cc_selfcheck_totals.values += (long long)n;
+	cc_selfcheck_totals.mismatches += (long long)h[0];
+	if (h[0] > 0 && cc_selfcheck_totals.mismatches == (long long)h[0])   // the first call that differs
+	{
+		XFLOAT va, vb;
+		HANDLE_ERROR(cudaMemcpy(&va, reference + h[1], sizeof(XFLOAT), cudaMemcpyDeviceToHost));
+		HANDLE_ERROR(cudaMemcpy(&vb, result + h[1], sizeof(XFLOAT), cudaMemcpyDeviceToHost));
+		printf("cc-selfcheck pid %d: first difference at score %llu of %zu: original %.9g, new %.9g\n",
+		       (int)getpid(), h[1], n, (double)va, (double)vb);
+		fflush(stdout);
+	}
+}
+
+static XFLOAT *cc_selfcheck_scratch(size_t n)
+{
+	static thread_local XFLOAT *buf = nullptr;
+	static thread_local size_t cap = 0;
+	if (n > cap)
+	{
+		if (buf != nullptr)
+			HANDLE_ERROR(cudaFree(buf));
+		HANDLE_ERROR(cudaMalloc(&buf, n * sizeof(XFLOAT)));
+		cap = n;
+	}
+	return buf;
+}
+#endif
+
 template<bool REF3D, bool DATA3D, int block_sz>
 void diff2_CC_coarse(
 		unsigned long grid_size,
@@ -1179,8 +1258,19 @@ void diff2_CC_coarse(
 		)
 {
 #ifdef _CUDA_ENABLED
-	dim3 CCblocks(grid_size,translation_num);
+	// One block per orientation and chunk of translations: each orientation is projected once per
+	// chunk rather than once per translation (see cuda_kernel_diff2_CC_coarse_projected_once).
+	dim3 CCblocks(grid_size, (translation_num + CC_TRANS_CHUNK - 1) / CC_TRANS_CHUNK);
+#ifdef CC_COARSE_SELFCHECK
+	const size_t cc_n = grid_size * translation_num;
+	XFLOAT *cc_reference = cc_selfcheck_scratch(cc_n);
+	HANDLE_ERROR(cudaMemcpyAsync(cc_reference, g_diff2s, cc_n * sizeof(XFLOAT), cudaMemcpyDeviceToDevice, stream));
 	cuda_kernel_diff2_CC_coarse<REF3D,DATA3D,block_sz>
+		<<<dim3(grid_size,translation_num),block_size,0,stream>>>(
+			g_eulers, g_imgs_real, g_imgs_imag, g_trans_x, g_trans_y, g_trans_z, projector,
+			g_corr_img, cc_reference, translation_num, image_size, exp_local_sqrtXi2);
+#endif
+	cuda_kernel_diff2_CC_coarse_projected_once<REF3D,DATA3D,block_sz>
 		<<<CCblocks,block_size,0,stream>>>(
 			g_eulers,
 			g_imgs_real,
@@ -1194,6 +1284,9 @@ void diff2_CC_coarse(
 			translation_num,
 			image_size,
 			exp_local_sqrtXi2);
+#ifdef CC_COARSE_SELFCHECK
+	cc_selfcheck(cc_reference, g_diff2s, cc_n, stream);
+#endif
 #elif _HIP_ENABLED
 	dim3 CCblocks(grid_size,translation_num);
 	hipLaunchKernelGGL(HIP_KERNEL_NAME(hip_kernel_diff2_CC_coarse<REF3D,DATA3D,block_sz>), dim3(CCblocks), dim3(block_size), 0, stream,
