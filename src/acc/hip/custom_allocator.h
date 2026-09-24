@@ -56,6 +56,7 @@ public:
 		bool free;
 		hipEvent_t readyEvent; //Event record used for auto free
 		bool freeWhenReady;
+		HipCustomAllocator *owner; //Supplies and takes back readyEvent
 
 
 #ifdef CUSTOM_ALLOCATOR_MEMGUARD
@@ -64,13 +65,14 @@ public:
 		size_t backtraceSize;
 #endif
 
-		Alloc():
+		Alloc(HipCustomAllocator *owner):
 			prev(NULL), next(NULL),
 			ptr(NULL),
 			size(0),
 			free(0),
 			readyEvent(0),
-			freeWhenReady(false)
+			freeWhenReady(false),
+			owner(owner)
 		{}
 
 		~Alloc()
@@ -99,8 +101,9 @@ public:
 		inline
 		void markReadyEvent(hipStream_t stream = 0)
 		{
-			//TODO add a debug warning if event already set
-			DEBUG_HANDLE_ERROR(hipEventCreate(&readyEvent));
+			// Recording again moves the event to the new point in the stream, as a new event would.
+			if (readyEvent == 0)
+				readyEvent = owner->_takeEvent();
 			DEBUG_HANDLE_ERROR(hipEventRecord(readyEvent, stream));
 		}
 
@@ -117,6 +120,35 @@ private:
 	bool cache;
 
 	omp_lock_t mutex;
+
+	// Ready events are recycled rather than created per deferred free and destroyed when the
+	// block is freed, as in the CUDA allocator: creating and destroying events serialises in the
+	// driver when several host threads do it. Nothing times these events. The pool has its own
+	// lock because markReadyEvent() runs outside the allocator's.
+	std::vector<hipEvent_t> eventPool;
+	omp_lock_t eventPoolMutex;
+
+	hipEvent_t _takeEvent()
+	{
+		hipEvent_t e = 0;
+		omp_set_lock(&eventPoolMutex);
+		if (!eventPool.empty())
+		{
+			e = eventPool.back();
+			eventPool.pop_back();
+		}
+		omp_unset_lock(&eventPoolMutex);
+		if (e == 0)
+			DEBUG_HANDLE_ERROR(hipEventCreateWithFlags(&e, hipEventDisableTiming));
+		return e;
+	}
+
+	void _returnEvent(hipEvent_t e)
+	{
+		omp_set_lock(&eventPoolMutex);
+		eventPool.push_back(e);
+		omp_unset_lock(&eventPoolMutex);
+	}
 
 
 	//Look for the first suited space
@@ -370,7 +402,7 @@ private:
 		a->freeWhenReady = false;
 		if (a->readyEvent != 0)
 		{
-			DEBUG_HANDLE_ERROR(hipEventDestroy(a->readyEvent));
+			_returnEvent(a->readyEvent);
 			a->readyEvent = 0;
 		}
 
@@ -435,7 +467,7 @@ private:
 
 	void _setup()
 	{
-		first = new Alloc();
+		first = new Alloc(this);
 		first->prev = NULL;
 		first->next = NULL;
 		first->size = totalSize;
@@ -475,6 +507,7 @@ public:
 		_setup();
 
 		omp_init_lock(&mutex);
+		omp_init_lock(&eventPoolMutex);
 	}
 
 	void resize(size_t size)
@@ -558,7 +591,7 @@ public:
 			else //Or curAlloc->size is smaller than size
 			{
 				//Setup new pointer
-				newAlloc = new Alloc();
+				newAlloc = new Alloc(this);
 				newAlloc->next = curAlloc;
 				newAlloc->ptr = curAlloc->ptr;
 				newAlloc->size = size;
@@ -580,7 +613,7 @@ public:
 		}
 		else
 		{
-			newAlloc = new Alloc();
+			newAlloc = new Alloc(this);
 			newAlloc->size = size;
 			newAlloc->free = false;
 			DEBUG_HANDLE_ERROR(hipMalloc( (void**) &(newAlloc->ptr), size));
@@ -608,6 +641,9 @@ public:
 			Lock ml(&mutex);
 			_clear();
 		}
+		for (size_t i = 0; i < eventPool.size(); i++)
+			DEBUG_HANDLE_ERROR(hipEventDestroy(eventPool[i]));
+		omp_destroy_lock(&eventPoolMutex);
 		omp_destroy_lock(&mutex);
 	}
 
