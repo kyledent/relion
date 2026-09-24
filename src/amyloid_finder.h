@@ -123,6 +123,11 @@ public:
     // Continue an old run: only estimate CTF if logfile WITH Final Values line does not yet exist, otherwise skip the tomogram
     bool do_only_unfinished;
 
+#ifdef TIMING
+    Timer timer;
+    int TIMING_A5;
+#endif
+
 public:
     // Read command line arguments
     void read(int argc, char **argv, int rank = 0);
