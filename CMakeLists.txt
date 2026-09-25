@@ -131,6 +131,7 @@ endif()
 option(DoublePrec_CPU "DoublePrec_CPU" ON)
 option(DoublePrec_ACC "Accelerated Code use double-precision" OFF)
 option(MKLFFT "Use MKL rather than FFTW for FFT" OFF)
+option(FFTW_THREADS "Multi-threaded FFTW outside the parallel expectation (maximisation, set-up); links fftw3_threads" OFF)
 option(DeviceTexture "Texture Memory on the Device" ON)
 
 if(ALTCPU)
@@ -504,6 +505,20 @@ if(NOT MKLFFT)
 	if(NOT FFTW_FOUND)
 		include(${CMAKE_SOURCE_DIR}/cmake/BuildFFTW.cmake)
 	endif(NOT FFTW_FOUND)
+
+	if(FFTW_THREADS)
+		if(NOT FFTW_FOUND)
+			message(FATAL_ERROR "FFTW_THREADS needs a system FFTW with libfftw3_threads, not the FFTW built here")
+		endif()
+		find_library(FFTW_THREADS_LIB NAMES fftw3_threads PATHS $ENV{FFTW_LIB} $ENV{FFTW_HOME})
+		if(NOT FFTW_THREADS_LIB)
+			message(FATAL_ERROR "FFTW_THREADS: libfftw3_threads was not found (set FFTW_LIB to its directory)")
+		endif()
+		# fftw3_threads depends on fftw3, so it goes first
+		set(FFTW_LIBRARIES ${FFTW_THREADS_LIB} ${FFTW_LIBRARIES})
+		add_definitions(-DFFTW_THREADS)
+		message(STATUS "FFTW_THREADS: ${FFTW_THREADS_LIB}")
+	endif()
 endif(NOT MKLFFT)
 
 # ---------------------------------------------------------------------------SIN/COS--
