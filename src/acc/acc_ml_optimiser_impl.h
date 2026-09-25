@@ -5,6 +5,65 @@ static omp_lock_t global_mutex;
 #if defined(_CUDA_ENABLED) && defined(__CUDACC__)
 #include "src/acc/cuda/cuda_coarse_gemm.cuh"
 
+// The orientation matrix R of one class and image size for this iteration (cuda_coarse_gemm.cuh), built on
+// first use and shared by the device's threads; NULL if it does not fit (the caller then runs the kernel).
+// ld: its leading dimension.
+template <class MlClass>
+static XFLOAT *coarseGemmMatrix(
+		MlClass *accMLO,
+		int iclass,
+		int iter,
+		AccProjectorKernel &projKernel,
+		XFLOAT *d_eulers,
+		size_t orientation_num,
+		size_t image_size,
+		cudaStream_t stream,
+		size_t &ld)
+{
+	CoarseGemmCache &cache = accMLO->bundle->coarseGemm;
+	const size_t K = 3 * image_size + 1;
+	ld = (K + 31) / 32 * 32;
+	std::lock_guard<std::mutex> lock(cache.mutex);
+	if (!cache.entries.empty() && cache.entries[0].iter != iter)
+		cache.release(accMLO->bundle->allocator);  // a bundle kept across iterations: references changed
+	for (CoarseGemmCache::Entry &e : cache.entries)
+		if (e.iclass == iclass && e.imgX == projKernel.imgX && e.imgY == projKernel.imgY &&
+		    e.image_size == image_size && e.orientation_num == orientation_num)
+			return e.R;
+	if (cache.disabled)
+		return NULL;
+	const size_t bytes = orientation_num * ld * sizeof(XFLOAT);
+	if (bytes > accMLO->bundle->allocator->getLargestContinuousFreeSpace() / 4)
+	{
+		cache.disabled = true;
+		return NULL;
+	}
+	CudaCustomAllocator::Alloc *a = accMLO->bundle->allocator->alloc(bytes);
+	XFLOAT *R = (XFLOAT *) a->getPtr();
+	CoarseGemm::cuda_kernel_coarse_gemm_R<<<orientation_num, COARSE_GEMM_BLOCK, 0, stream>>>(
+			d_eulers, projKernel, R, (int) image_size, ld);
+	LAUNCH_HANDLE_ERROR(cudaGetLastError());
+	// Other threads read it on their own streams.
+	HANDLE_ERROR(cudaStreamSynchronize(stream));
+	cache.entries.push_back({iclass, projKernel.imgX, projKernel.imgY, iter, image_size, orientation_num, ld, a, R});
+	return R;
+}
+
+// This thread's cuBLAS handle, made on first use, set to stream.
+template <class MlClass>
+static cublasHandle_t coarseGemmHandle(MlClass *accMLO, cudaStream_t stream)
+{
+	cublasHandle_t &h = accMLO->coarseGemmHandle;
+	if (h == NULL)
+	{
+		CoarseGemm::handleCublas(cublasCreate(&h), "create");
+		if (CoarseGemm::mode() == 2)
+			CoarseGemm::handleCublas(cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH), "set TF32 math");
+	}
+	CoarseGemm::handleCublas(cublasSetStream(h, stream), "set stream");
+	return h;
+}
+
 // The coarse scores of one image and class as a GEMM (cuda_coarse_gemm.cuh), added into diff2s in the
 // kernel's layout. Returns false, having done nothing, if the class's matrix does not fit; the caller
 // then runs the kernel.
@@ -27,39 +86,11 @@ static bool coarseGemmScores(
 		XFLOAT *diff2s,
 		cudaStream_t stream)
 {
-	CoarseGemmCache &cache = accMLO->bundle->coarseGemm;
+	size_t ld;
+	XFLOAT *R = coarseGemmMatrix(accMLO, iclass, iter, projKernel, d_eulers, orientation_num, image_size, stream, ld);
+	if (R == NULL)
+		return false;
 	const size_t K = 3 * image_size + 1;
-	const size_t ld = (K + 31) / 32 * 32;
-	XFLOAT *R = NULL;
-	{
-		std::lock_guard<std::mutex> lock(cache.mutex);
-		if (!cache.entries.empty() && cache.entries[0].iter != iter)
-			cache.release(accMLO->bundle->allocator);  // a bundle kept across iterations: references changed
-		for (CoarseGemmCache::Entry &e : cache.entries)
-			if (e.iclass == iclass && e.imgX == projKernel.imgX && e.imgY == projKernel.imgY &&
-			    e.image_size == image_size && e.orientation_num == orientation_num)
-				R = e.R;
-		if (R == NULL)
-		{
-			if (cache.disabled)
-				return false;
-			const size_t bytes = orientation_num * ld * sizeof(XFLOAT);
-			if (bytes > accMLO->bundle->allocator->getLargestContinuousFreeSpace() / 4)
-			{
-				cache.disabled = true;
-				return false;
-			}
-			CudaCustomAllocator::Alloc *a = accMLO->bundle->allocator->alloc(bytes);
-			R = (XFLOAT *) a->getPtr();
-			CoarseGemm::cuda_kernel_coarse_gemm_R<<<orientation_num, COARSE_GEMM_BLOCK, 0, stream>>>(
-					d_eulers, projKernel, R, (int) image_size, ld);
-			LAUNCH_HANDLE_ERROR(cudaGetLastError());
-			// Other threads read it on their own streams.
-			HANDLE_ERROR(cudaStreamSynchronize(stream));
-			cache.entries.push_back({iclass, projKernel.imgX, projKernel.imgY, iter, image_size,
-			                         orientation_num, ld, a, R});
-		}
-	}
 
 	AccPtr<XFLOAT> Q = ptrFactory.make<XFLOAT>(translation_num * ld);
 	Q.setStream(stream);
@@ -68,14 +99,7 @@ static bool coarseGemmScores(
 			trans_x, trans_y, img_re, img_im, corr, projKernel, ~Q, (int) image_size, ld);
 	LAUNCH_HANDLE_ERROR(cudaGetLastError());
 
-	cublasHandle_t &h = accMLO->coarseGemmHandle;
-	if (h == NULL)
-	{
-		CoarseGemm::handleCublas(cublasCreate(&h), "create");
-		if (CoarseGemm::mode() == 2)
-			CoarseGemm::handleCublas(cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH), "set TF32 math");
-	}
-	CoarseGemm::handleCublas(cublasSetStream(h, stream), "set stream");
+	cublasHandle_t h = coarseGemmHandle(accMLO, stream);
 	// diff2s[o * T + t] += sum_k Q[t][k] R[o][k]: column-major C (T x O) += Q^T (T x K) R (K x O).
 	const float one = 1.f;
 	CoarseGemm::handleCublas(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -4280,3 +4304,430 @@ baseMLO->timer.toc(baseMLO->TIMING_ESP_DIFF2_E);
 
 	CTOC(timer,"oneParticle");
 }
+
+#if defined(_CUDA_ENABLED) && defined(__CUDACC__)
+// ----------------------------------------------------------------------------
+// ------------- accDoExpectationParticleBatch (batched coarse GEMM) ----------
+// ----------------------------------------------------------------------------
+// A thread's task of several particles, with the coarse pass of all of them scored in one GEMM per class
+// (cuda_coarse_gemm.cuh, RELION_COARSE_GEMM_BATCH). Every other step is accDoExpectationOneParticle's,
+// run particle by particle; only the order changes: all particles' preparation, then the batched
+// coarse pass, then each particle's weights, fine pass and weighted sums.
+
+// One particle's state between the phases.
+struct AccBatchParticle
+{
+	unsigned long part_id_sorted = 0;
+	long int part_id = 0;
+	SamplingParameters sp;
+	std::unique_ptr<OptimisationParamters> op;
+	std::unique_ptr<IndexedDataArray> CoarsePassWeights, FinePassWeights;
+	std::unique_ptr<std::vector<IndexedDataArrayMask> > FinePassClassMasks;
+	std::unique_ptr<ProjectionParams> FineProjectionData;
+	std::unique_ptr<AccPtr<XFLOAT> > Mweight;
+	// the coarse pass's operands (as getAllSquaredDifferencesCoarse prepares them), and its geometry
+	std::unique_ptr<AccPtr<XFLOAT> > allWeights, Fimg, trans, corr;
+	size_t image_size = 0, translation_num = 0;
+	int imgX = 0, imgY = 0, imgZ = 0;
+	std::vector<size_t> classPos;  // offset of each class's scores in allWeights (per class index)
+};
+
+// Can this iteration's coarse pass use the batch path? (One image per particle is checked per task.)
+template <class MlClass>
+static bool coarseGemmBatchEligible(MlClass *accMLO)
+{
+	MlOptimiser *b = accMLO->baseMLO;
+	const bool do_CC = (b->iter == 1 && b->do_firstiter_cc) || b->do_always_cc;
+	return CoarseGemm::mode() > 0 && CoarseGemm::batch() > 1 && !do_CC && accMLO->refIs3D &&
+	       !accMLO->dataIs3D && !accMLO->generateProjectionPlanOnTheFly && b->mymodel.nr_bodies == 1 &&
+	       !b->mydata.is_tomo && !b->do_skip_align && !b->do_skip_rotate && !b->do_only_sample_tilt &&
+	       !(b->do_helical_refine && !b->ignore_helical_symmetry);
+}
+
+// The coarse pass of several particles: their operands as getAllSquaredDifferencesCoarse prepares them for
+// one image, then per class one GEMM for all particles whose class range holds it (grouped by image size),
+// each particle's block added into its weights, and the weights mapped to its Mweight.
+template <class MlClass>
+static void getAllSquaredDifferencesCoarseBatch(
+		std::vector<AccBatchParticle *> &parts,
+		MlOptimiser *baseMLO,
+		MlClass *accMLO,
+		AccPtrFactory &ptrFactory)
+{
+	std::vector<AccProjectorPlan> &plans = accMLO->bundle->coarseProjectionPlans;
+	const int nr_classes = baseMLO->mymodel.nr_classes;
+
+	// 1. Each particle's operands.
+	for (AccBatchParticle *pp : parts)
+	{
+		OptimisationParamters &op = *pp->op;
+		SamplingParameters &sp = pp->sp;
+		std::vector<MultidimArray<Complex > > dummy;
+		std::vector<std::vector<MultidimArray<Complex > > > dummy2;
+		MultidimArray<RFLOAT> dummyRF;
+		baseMLO->precalculateShiftedImagesCtfsAndInvSigma2s(false, false, op.part_id, sp.current_oversampling, op.metadata_offset,
+				sp.itrans_min, sp.itrans_max, op.Fimg, dummy, op.Fctf, op.old_offset, dummy2, dummy2,
+				op.local_Fctf, op.local_sqrtXi2, op.local_Minvsigma2, op.FstMulti, dummyRF);
+
+		const int optics_group = baseMLO->mydata.getOpticsGroup(op.part_id);
+		const long int group_id = baseMLO->mydata.getGroupId(op.part_id);
+		const RFLOAT my_pixel_size = baseMLO->mydata.getImagePixelSize(op.part_id);
+		const size_t T = (sp.itrans_max - sp.itrans_min + 1) * sp.nr_oversampled_trans;
+		const size_t image_size = op.local_Minvsigma2.nzyxdim;
+		pp->translation_num = T;
+		pp->image_size = image_size;
+		pp->imgX = op.local_Minvsigma2.xdim;
+		pp->imgY = op.local_Minvsigma2.ydim;
+		pp->imgZ = op.local_Minvsigma2.zdim;
+
+		pp->classPos.assign(nr_classes, 0);
+		size_t nW = 0;
+		for (int c = sp.iclass_min; c <= sp.iclass_max; c++)
+		{
+			pp->classPos[c] = nW;
+			nW += plans[c].orientation_num * T;
+		}
+		pp->allWeights.reset(new AccPtr<XFLOAT>(ptrFactory.make<XFLOAT>(nW)));
+		pp->allWeights->accAlloc();
+		deviceInitValue<XFLOAT>(*pp->allWeights, 0);
+		AccUtilities::add<XFLOAT>(BLOCK_SIZE, pp->allWeights->getStream(), (XFLOAT *) ~(*pp->allWeights),
+				(XFLOAT) (op.highres_Xi2_img[0] / 2.), pp->allWeights->getSize());
+
+		// translations, as getAllSquaredDifferencesCoarse: 2D shifts, no helical or tomogram terms here
+		pp->trans.reset(new AccPtr<XFLOAT>(ptrFactory.make<XFLOAT>(3 * T)));
+		pp->trans->allAlloc();
+		std::vector<RFLOAT> ox, oy, oz;
+		for (size_t itrans = 0; itrans < T; itrans++)
+		{
+			baseMLO->sampling.getTranslationsInPixel(itrans, 0, my_pixel_size, ox, oy, oz, false);
+			(*pp->trans)[itrans] = -2 * PI * ox[0] / (double) baseMLO->image_full_size[optics_group];
+			(*pp->trans)[T + itrans] = -2 * PI * oy[0] / (double) baseMLO->image_full_size[optics_group];
+			(*pp->trans)[2 * T + itrans] = -2 * PI * 0. / (double) baseMLO->image_full_size[optics_group];
+		}
+		pp->trans->cpToDevice();
+
+		// the image, windowed and corrected as getAllSquaredDifferencesCoarse does
+		XFLOAT scale_correction = baseMLO->do_scale_correction ? baseMLO->mymodel.scale_correction[group_id] : 1;
+		int exp_current_image_size = (baseMLO->strict_highres_exp > 0.|| baseMLO->adaptive_oversampling > 0) ?
+				baseMLO->image_coarse_size[optics_group] : baseMLO->image_current_size[optics_group];
+		MultidimArray<Complex > Fimg;
+		windowFourierTransform(op.Fimg[0], Fimg, exp_current_image_size);
+		pp->Fimg.reset(new AccPtr<XFLOAT>(ptrFactory.make<XFLOAT>(2 * image_size)));
+		pp->Fimg->allAlloc();
+		for (unsigned long i = 0; i < image_size; i ++)
+		{
+			XFLOAT pixel_correction = 1.0/scale_correction;
+			if (baseMLO->do_ctf_correction && fabs(op.local_Fctf[0].data[i]) > 1e-8)
+			{
+				if (baseMLO->refs_are_ctf_corrected)
+				{
+					pixel_correction /= op.local_Fctf[0].data[i];
+				}
+			}
+			(*pp->Fimg)[i] = Fimg.data[i].real * pixel_correction;
+			(*pp->Fimg)[image_size + i] = Fimg.data[i].imag * pixel_correction;
+		}
+		pp->Fimg->cpToDevice();
+
+		pp->corr.reset(new AccPtr<XFLOAT>(ptrFactory.make<XFLOAT>(image_size)));
+		pp->corr->allAlloc();
+		buildCorrImage(baseMLO, op, *pp->corr, 0, group_id);
+		pp->corr->cpToDevice();
+	}
+	for (int c = 0; c < nr_classes; c++)
+		DEBUG_HANDLE_ERROR(cudaStreamSynchronize(accMLO->classStreams[c]));
+	DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
+
+	// 2. Per class, one GEMM per group of particles with the same image size and translation count.
+	std::vector<std::unique_ptr<AccPtr<XFLOAT> > > keep;       // freed after the final synchronisation
+	std::vector<std::unique_ptr<AccPtr<XFLOAT *> > > keepPtrs;
+	for (int c = 0; c < nr_classes; c++)
+	{
+		const size_t O = plans[c].orientation_num;
+		std::vector<AccBatchParticle *> in;
+		for (AccBatchParticle *pp : parts)
+			if (O > 0 && c >= pp->sp.iclass_min && c <= pp->sp.iclass_max)
+				in.push_back(pp);
+		while (!in.empty())
+		{
+			std::vector<AccBatchParticle *> g, rest;
+			for (AccBatchParticle *pp : in)
+				(pp->image_size == in[0]->image_size && pp->imgX == in[0]->imgX && pp->imgY == in[0]->imgY &&
+				 pp->translation_num == in[0]->translation_num ? g : rest).push_back(pp);
+			in.swap(rest);
+
+			cudaStream_t stream = accMLO->classStreams[c];
+			const size_t T = g[0]->translation_num, P = g[0]->image_size;
+			AccProjectorKernel projKernel = AccProjectorKernel::makeKernel(accMLO->bundle->projectors[c],
+					g[0]->imgX, g[0]->imgY, g[0]->imgZ, g[0]->imgX - 1);
+			size_t ld;
+			XFLOAT *R = coarseGemmMatrix(accMLO, c, baseMLO->iter, projKernel, ~plans[c].eulers, O, P, stream, ld);
+			if (R == NULL)
+			{
+				// the class's matrix does not fit: the kernel, particle by particle
+				for (AccBatchParticle *pp : g)
+				{
+					runDiff2KernelCoarse(projKernel, &(~(*pp->trans))[0], &(~(*pp->trans))[T], &(~(*pp->trans))[2 * T],
+							~(*pp->corr), &(~(*pp->Fimg))[0], &(~(*pp->Fimg))[P], ~plans[c].eulers,
+							&(~(*pp->allWeights))[pp->classPos[c]], (XFLOAT) pp->op->local_sqrtXi2[0], O, T, P,
+							stream, false, false);
+					CoarseGemm::totals.kernel++;
+				}
+			}
+			else
+			{
+				const int nP = (int) g.size();
+				const size_t K = 3 * P + 1;
+				keep.emplace_back(new AccPtr<XFLOAT>(ptrFactory.make<XFLOAT>((size_t) nP * T * ld)));
+				AccPtr<XFLOAT> &Q = *keep.back();
+				Q.setStream(stream);
+				Q.deviceAlloc();
+				for (int p = 0; p < nP; p++)
+				{
+					AccBatchParticle *pp = g[p];
+					CoarseGemm::cuda_kernel_coarse_gemm_Q<<<T, COARSE_GEMM_BLOCK, 0, stream>>>(
+							&(~(*pp->trans))[0], &(~(*pp->trans))[T], &(~(*pp->Fimg))[0], &(~(*pp->Fimg))[P],
+							~(*pp->corr), projKernel, ~Q + (size_t) p * T * ld, (int) P, ld);
+					LAUNCH_HANDLE_ERROR(cudaGetLastError());
+				}
+				keep.emplace_back(new AccPtr<XFLOAT>(ptrFactory.make<XFLOAT>((size_t) nP * T * O)));
+				AccPtr<XFLOAT> &C = *keep.back();
+				C.setStream(stream);
+				C.deviceAlloc();
+				// C (nP*T x O, column-major) = Q^T (nP*T x K) R (K x O)
+				cublasHandle_t h = coarseGemmHandle(accMLO, stream);
+				const float one = 1.f, zero = 0.f;
+				CoarseGemm::handleCublas(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
+						(int) (nP * T), (int) O, (int) K, &one, ~Q, (int) ld, R, (int) ld, &zero, ~C, (int) (nP * T)),
+						"sgemm (batch)");
+				keepPtrs.emplace_back(new AccPtr<XFLOAT *>(ptrFactory.make<XFLOAT *>((size_t) nP)));
+				AccPtr<XFLOAT *> &dst = *keepPtrs.back();
+				dst.setStream(stream);
+				dst.allAlloc();
+				for (int p = 0; p < nP; p++)
+					dst[p] = &(~(*g[p]->allWeights))[g[p]->classPos[c]];
+				dst.cpToDevice();
+				CoarseGemm::cuda_kernel_coarse_gemm_scatter<<<dim3((unsigned) O, (unsigned) nP), 64, 0, stream>>>(
+						~C, ~dst, nP, (int) T, 0);
+				LAUNCH_HANDLE_ERROR(cudaGetLastError());
+				CoarseGemm::totals.gemm += nP;
+				CoarseGemm::totals.batches++;
+				CoarseGemm::totals.batched += nP;
+
+				// Check (RELION_COARSE_GEMM_CHECK=n): every n-th particle also by the kernel; the GEMM's scores are kept.
+				for (int p = 0; p < nP; p++)
+				{
+					if (!(CoarseGemm::checkCount() > 0 && CoarseGemm::totals.seen++ % CoarseGemm::checkCount() == 0))
+						continue;
+					CoarseGemm::totals.checked++;
+					AccBatchParticle *pp = g[p];
+					const size_t n = O * T;
+					AccPtr<XFLOAT> dG = ptrFactory.make<XFLOAT>(n), dK = ptrFactory.make<XFLOAT>(n);
+					dG.setStream(stream); dK.setStream(stream);
+					dG.allAlloc(); dK.allAlloc();
+					deviceInitValue<XFLOAT>(dG, 0); deviceInitValue<XFLOAT>(dK, 0);
+					AccPtr<XFLOAT *> one_dst = ptrFactory.make<XFLOAT *>((size_t) 1);
+					one_dst.setStream(stream);
+					one_dst.allAlloc();
+					one_dst[0] = ~dG;
+					one_dst.cpToDevice();
+					CoarseGemm::cuda_kernel_coarse_gemm_scatter<<<dim3((unsigned) O, 1u), 64, 0, stream>>>(
+							~C, ~one_dst, nP, (int) T, p);
+					LAUNCH_HANDLE_ERROR(cudaGetLastError());
+					runDiff2KernelCoarse(projKernel, &(~(*pp->trans))[0], &(~(*pp->trans))[T], &(~(*pp->trans))[2 * T],
+							~(*pp->corr), &(~(*pp->Fimg))[0], &(~(*pp->Fimg))[P], ~plans[c].eulers, ~dK,
+							(XFLOAT) pp->op->local_sqrtXi2[0], O, T, P, stream, false, false);
+					dG.cpToHost(); dK.cpToHost(); dK.streamSync();
+					double maxDiff = 0., maxK = 0., maxRel = 0.;
+					for (size_t i = 0; i < n; i++)
+					{
+						const double d = fabs((double) dG[i] - (double) dK[i]), k = fabs((double) dK[i]);
+						maxDiff = std::max(maxDiff, d);
+						maxK = std::max(maxK, k);
+						if (k > 0.) maxRel = std::max(maxRel, d / k);
+					}
+					printf("coarse-gemm-check iter %d class %d: %zu orientations x %zu translations, %zu pixels: "
+					       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e (batch of %d)\n",
+					       baseMLO->iter, c, O, T, P, maxDiff, maxK, maxRel, nP);
+					fflush(stdout);
+				}
+			}
+			for (AccBatchParticle *pp : g)
+				mapAllWeightsToMweights(~plans[c].iorientclasses, &(~(*pp->allWeights))[pp->classPos[c]],
+						&(~(*pp->Mweight))[0], O, T, stream);
+		}
+	}
+	for (int c = 0; c < nr_classes; c++)
+		DEBUG_HANDLE_ERROR(cudaStreamSynchronize(accMLO->classStreams[c]));
+	DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
+
+	// 3. Each particle's smallest score, as getAllSquaredDifferencesCoarse ends.
+	for (AccBatchParticle *pp : parts)
+	{
+		pp->op->min_diff2 = AccUtilities::getMinOnDevice<XFLOAT>(*pp->allWeights);
+		pp->allWeights.reset();
+		pp->Fimg.reset();
+		pp->trans.reset();
+		pp->corr.reset();
+	}
+}
+
+template <class MlClass>
+void accDoExpectationParticleBatch(MlClass *myInstance, unsigned long first_sorted, unsigned long last_sorted,
+		int thread_id, AccPtrFactory ptrFactory)
+{
+	MlOptimiser *baseMLO = myInstance->baseMLO;
+
+	// One image per particle only; otherwise the particles go one by one.
+	for (unsigned long ps = first_sorted; ps <= last_sorted; ps++)
+		if (baseMLO->mydata.numberOfImagesInParticle(baseMLO->mydata.sorted_idx[ps]) != 1)
+		{
+			for (unsigned long q = first_sorted; q <= last_sorted; q++)
+				accDoExpectationOneParticle<MlClass>(myInstance, q, thread_id, ptrFactory);
+			return;
+		}
+
+	// 1. Each particle up to its coarse pass, as accDoExpectationOneParticle does it (one body).
+	std::vector<std::unique_ptr<AccBatchParticle> > parts;
+	for (unsigned long ps = first_sorted; ps <= last_sorted; ps++)
+	{
+		std::unique_ptr<AccBatchParticle> up(new AccBatchParticle);
+		AccBatchParticle &pp = *up;
+		SamplingParameters &sp = pp.sp;
+		pp.part_id_sorted = ps;
+		long int part_id = baseMLO->mydata.sorted_idx[ps];
+		pp.part_id = part_id;
+		sp.nr_images = baseMLO->mydata.numberOfImagesInParticle(part_id);
+
+		sp.iclass_min = 0;
+		sp.iclass_max = baseMLO->mymodel.nr_classes - 1;
+		if (baseMLO->do_generate_seeds)
+		{
+			if (baseMLO->do_firstiter_cc && baseMLO->iter == 1)
+			{
+				sp.iclass_min = sp.iclass_max = 0;
+			}
+			else if ( (baseMLO->do_firstiter_cc && baseMLO->iter == 2) ||
+					(!baseMLO->do_firstiter_cc && baseMLO->iter == 1))
+			{
+				long int idx = ps - baseMLO->exp_my_first_part_id;
+				if (idx >= baseMLO->exp_random_class_some_particles.size())
+					REPORT_ERROR("BUG: expectationOneParticle idx>random_class_some_particles.size()");
+				sp.iclass_min = sp.iclass_max = baseMLO->exp_random_class_some_particles[idx];
+			}
+		}
+
+		pp.op.reset(new OptimisationParamters(sp.nr_images, part_id, baseMLO->mydata.is_tomo));
+		OptimisationParamters &op = *pp.op;
+		if (baseMLO->mydata.is_3D)
+			op.FstMulti.resize(sp.nr_images);
+		for (long int iori = baseMLO->exp_my_first_part_id; iori <= baseMLO->exp_my_last_part_id; iori++)
+		{
+			if (iori == ps) break;
+			op.metadata_offset += 1;
+		}
+		getFourierTransformsAndCtfs<MlClass>(part_id, op, sp, baseMLO, myInstance, ptrFactory, 0);
+
+		sp.itrans_min = 0;
+		sp.itrans_max = baseMLO->sampling.NrTranslationalSamplings() - 1;
+		sp.idir_min = sp.ipsi_min = 0;
+		sp.idir_max = baseMLO->sampling.NrDirections(0, &op.pointer_dir_nonzeroprior) - 1;
+		sp.ipsi_max = baseMLO->sampling.NrPsiSamplings(0, &op.pointer_psi_nonzeroprior ) - 1;
+		op.significant_weight = -1.;
+
+		pp.CoarsePassWeights.reset(new IndexedDataArray(ptrFactory));
+		pp.FinePassWeights.reset(new IndexedDataArray(ptrFactory));
+		pp.FinePassClassMasks.reset(new std::vector<IndexedDataArrayMask>(baseMLO->mymodel.nr_classes, ptrFactory));
+		pp.FineProjectionData.reset(new ProjectionParams(baseMLO->mymodel.nr_classes));
+
+		// pass 0 (coarse)
+		sp.current_oversampling = 0;
+		sp.nr_dir = baseMLO->sampling.NrDirections(0, &op.pointer_dir_nonzeroprior);
+		sp.nr_psi = baseMLO->sampling.NrPsiSamplings(0, &op.pointer_psi_nonzeroprior);
+		sp.nr_trans = baseMLO->sampling.NrTranslationalSamplings();
+		sp.nr_oversampled_rot = baseMLO->sampling.oversamplingFactorOrientations(sp.current_oversampling);
+		sp.nr_oversampled_trans = baseMLO->sampling.oversamplingFactorTranslations(sp.current_oversampling);
+		op.min_diff2 = 0.;
+
+		unsigned long weightsPerPart(baseMLO->mymodel.nr_classes * sp.nr_dir * sp.nr_psi * sp.nr_trans * sp.nr_oversampled_rot * sp.nr_oversampled_trans);
+		op.Mweight.resizeNoCp(1,1,1, weightsPerPart);
+		pp.Mweight.reset(new AccPtr<XFLOAT>(ptrFactory.make<XFLOAT>()));
+		pp.Mweight->setSize(weightsPerPart);
+		pp.Mweight->setHostPtr(op.Mweight.data);
+		pp.Mweight->deviceAlloc();
+		deviceInitValue<XFLOAT>(*pp.Mweight, std::numeric_limits<XFLOAT>::lowest());
+		pp.Mweight->streamSync();
+		parts.push_back(std::move(up));
+	}
+
+	// 2. The coarse pass of all of them.
+	std::vector<AccBatchParticle *> raw;
+	for (std::unique_ptr<AccBatchParticle> &up : parts)
+		raw.push_back(up.get());
+#ifdef TIMING
+	const bool timeIt = (raw[0]->part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id]);
+	if (timeIt)
+		baseMLO->timer.tic(baseMLO->TIMING_ESP_DIFF1);
+#endif
+	getAllSquaredDifferencesCoarseBatch<MlClass>(raw, baseMLO, myInstance, ptrFactory);
+#ifdef TIMING
+	if (timeIt)
+		baseMLO->timer.toc(baseMLO->TIMING_ESP_DIFF1);
+#endif
+
+	// 3. Each particle's coarse weights, fine pass and weighted sums, as accDoExpectationOneParticle.
+	for (std::unique_ptr<AccBatchParticle> &up : parts)
+	{
+		AccBatchParticle &pp = *up;
+		OptimisationParamters &op = *pp.op;
+		SamplingParameters &sp = pp.sp;
+		IndexedDataArray &CoarsePassWeights = *pp.CoarsePassWeights;
+		IndexedDataArray &FinePassWeights = *pp.FinePassWeights;
+		std::vector<IndexedDataArrayMask> &FinePassClassMasks = *pp.FinePassClassMasks;
+		ProjectionParams &FineProjectionData = *pp.FineProjectionData;
+		const int ibody = 0;
+
+		convertAllSquaredDifferencesToWeights<MlClass>(0, op, sp, baseMLO, myInstance, CoarsePassWeights, FinePassClassMasks, *pp.Mweight, ptrFactory, ibody);
+		pp.Mweight.reset();
+
+		// pass 1 (fine)
+		const int ipass = 1;
+		sp.current_oversampling = baseMLO->adaptive_oversampling;
+		sp.nr_dir = baseMLO->sampling.NrDirections(0, &op.pointer_dir_nonzeroprior);
+		sp.nr_psi = baseMLO->sampling.NrPsiSamplings(0, &op.pointer_psi_nonzeroprior);
+		sp.nr_trans = baseMLO->sampling.NrTranslationalSamplings();
+		sp.nr_oversampled_rot = baseMLO->sampling.oversamplingFactorOrientations(sp.current_oversampling);
+		sp.nr_oversampled_trans = baseMLO->sampling.oversamplingFactorTranslations(sp.current_oversampling);
+		op.min_diff2 = 0.;
+
+		FineProjectionData.orientationNumAllClasses = 0;
+		for (int exp_iclass = sp.iclass_min; exp_iclass <= sp.iclass_max; exp_iclass++)
+		{
+			if (exp_iclass > 0)
+				FineProjectionData.class_idx[exp_iclass] = FineProjectionData.rots.size();
+			FineProjectionData.class_entries[exp_iclass] = 0;
+			FineProjectionData.orientationNumAllClasses += generateProjectionSetupFine(
+					op,
+					sp,
+					baseMLO,
+					exp_iclass,
+					FineProjectionData);
+		}
+		size_t dataSize = FineProjectionData.orientationNumAllClasses*sp.nr_trans*sp.nr_oversampled_trans;
+		FinePassWeights.setDataSize(dataSize);
+		FinePassWeights.dual_alloc_all();
+
+		getAllSquaredDifferencesFine<MlClass>(ipass, op, sp, baseMLO, myInstance, FinePassWeights, FinePassClassMasks, FineProjectionData, ptrFactory, ibody);
+		FinePassWeights.weights.cpToHost();
+		AccPtr<XFLOAT> Mweight = ptrFactory.make<XFLOAT>(); //DUMMY
+		convertAllSquaredDifferencesToWeights<MlClass>(ipass, op, sp, baseMLO, myInstance, FinePassWeights, FinePassClassMasks, Mweight, ptrFactory, ibody);
+
+		sp.current_image_size = baseMLO->mymodel.current_size;
+		AccPtrBundle bundleSWS(ptrFactory.makeBundle());
+		bundleSWS.setSize(2*(FineProjectionData.orientationNumAllClasses)*sizeof(unsigned long));
+		bundleSWS.allAlloc();
+		storeWeightedSums<MlClass>(op, sp, baseMLO, myInstance, FinePassWeights, FineProjectionData, FinePassClassMasks, ptrFactory, ibody, bundleSWS);
+		FinePassWeights.dual_free_all();
+	}
+}
+#endif

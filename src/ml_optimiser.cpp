@@ -4304,7 +4304,14 @@ void MlOptimiser::expectationSomeParticles(long int my_first_part_id, long int m
     {
         // GPU and traditional CPU case - use RELION's built-in task manager to
         // process multiple particles at once
-        exp_ipart_ThreadTaskDistributor->resize(my_last_part_id - my_first_part_id + 1, 1);
+        // With the coarse pass as a batched GEMM (CUDA: RELION_COARSE_GEMM with RELION_COARSE_GEMM_BATCH >= 2), a
+        // thread takes that many particles at once and scores their coarse pass together.
+        size_t task_size = 1;
+        if (do_gpu && getenv("RELION_COARSE_GEMM") && atoi(getenv("RELION_COARSE_GEMM")) > 0 &&
+            getenv("RELION_COARSE_GEMM_BATCH") && atoi(getenv("RELION_COARSE_GEMM_BATCH")) > 1)
+            task_size = XMIPP_MIN((size_t) atoi(getenv("RELION_COARSE_GEMM_BATCH")),
+                                  (size_t) (my_last_part_id - my_first_part_id + 1));
+        exp_ipart_ThreadTaskDistributor->resize(my_last_part_id - my_first_part_id + 1, task_size);
         exp_ipart_ThreadTaskDistributor->reset();
         #pragma omp parallel for num_threads(nr_threads)
         for (int thread_id = 0; thread_id < nr_threads; thread_id++)

@@ -271,6 +271,14 @@ void MlOptimiserCuda::doThreadExpectationSomeParticles(int thread_id)
 
 	while (baseMLO->exp_ipart_ThreadTaskDistributor->getTasks(first_ipart, last_ipart))
 	{
+		// Several particles at once with the coarse pass as one GEMM (RELION_COARSE_GEMM_BATCH).
+		if (last_ipart > first_ipart && coarseGemmBatchEligible(this))
+		{
+			AccPtrFactory ptrFactory(allocator, cudaStreamPerThread);
+			accDoExpectationParticleBatch<MlOptimiserCuda>(this, baseMLO->exp_my_first_part_id + first_ipart,
+					baseMLO->exp_my_first_part_id + last_ipart, thread_id, ptrFactory);
+			continue;
+		}
 		CTIC(timer,"oneTask");
 		for (long unsigned ipart = first_ipart; ipart <= last_ipart; ipart++)
 		{
