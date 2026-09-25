@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <signal.h>
 #include <vector>
+#include <thrust/iterator/counting_iterator.h>
 // Because thrust uses CUB, thrust defines CubLog and CUB tries to redefine it,
 // resulting in warnings. This avoids those warnings.
 #if(defined(CubLog) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__<= 520)) // Intetionally force a warning for new arch
@@ -324,6 +325,29 @@ if (in.getAllocator() == NULL)
 	DEBUG_HANDLE_ERROR(cudaStreamSynchronize(stream));
 
 	in.getAllocator()->free(alloc);
+	return num_selected_out[0];
+}
+
+// The indices i with flags[i] set, in increasing order, into out (at least flags.getSize() long); returns
+// how many there are. Runs on stream and waits for it.
+static int flaggedIndicesOnDevice(AccPtr<bool> &flags, AccPtr<int> &out, cudaStream_t stream)
+{
+	size_t temp_storage_size = 0;
+	AccPtr<int> num_selected_out(1, stream, flags.getAllocator());
+	num_selected_out.deviceAlloc();
+	thrust::counting_iterator<int> index(0);
+
+	DEBUG_HANDLE_ERROR(cub::DeviceSelect::Flagged(NULL, temp_storage_size, index, ~flags, ~out, ~num_selected_out,
+			(int) flags.getSize(), stream));
+	if(temp_storage_size==0)
+		temp_storage_size=1;
+	CudaCustomAllocator::Alloc* alloc = flags.getAllocator()->alloc(temp_storage_size);
+	DEBUG_HANDLE_ERROR(cub::DeviceSelect::Flagged(alloc->getPtr(), temp_storage_size, index, ~flags, ~out, ~num_selected_out,
+			(int) flags.getSize(), stream));
+
+	num_selected_out.cpToHost();
+	DEBUG_HANDLE_ERROR(cudaStreamSynchronize(stream));
+	flags.getAllocator()->free(alloc);
 	return num_selected_out[0];
 }
 

@@ -1,6 +1,24 @@
 static omp_lock_t global_mutex;
 
 #include "src/acc/acc_operand_dump.h"
+#include <climits>
+#include <atomic>
+#include <unistd.h>
+
+// RELION_SIG_COMPACT (convertAllSquaredDifferencesToWeights, CUDA): 1 copies back only the indices of the coarse
+// pass's significant samples; 2 does that and the full copy, compares them, and prints the totals at exit.
+struct SigCompactTotals
+{
+	std::atomic<long long> checked{0}, mismatched{0}, entries{0}, significant{0};
+	~SigCompactTotals()
+	{
+		if (checked > 0)
+			printf("sig-compact-check pid %d: %lld particles checked, %lld entries, %lld significant, %lld particles differ\n",
+			       (int)getpid(), (long long)checked, (long long)entries, (long long)significant, (long long)mismatched);
+		fflush(stdout);
+	}
+};
+static SigCompactTotals sig_compact_totals;
 
 #if defined(_CUDA_ENABLED) && defined(__CUDACC__)
 #include "src/acc/cuda/cuda_coarse_gemm.cuh"
@@ -2677,7 +2695,41 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
 #elif _CUDA_ENABLED
                 DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
                 arrayOverThreshold<XFLOAT>(unsorted_ipart, Mcoarse_significant, significant_weight);
-                Mcoarse_significant.cpToHost();
+                // RELION_SIG_COMPACT=1: bring back only the significant entries' indices (few, in a global search)
+                // instead of the whole mask, and set the same mask on the host
+                static const int sig_compact = getenv("RELION_SIG_COMPACT") != NULL ? atoi(getenv("RELION_SIG_COMPACT")) : 0;
+                if (sig_compact > 0 && ipart_length < (unsigned long) INT_MAX)
+                {
+                    AccPtr<int> sig_idx = ptrFactory.make<int>((size_t) ipart_length);
+                    sig_idx.deviceAlloc();
+                    const cudaStream_t sig_stream = unsorted_ipart.getStream();
+                    const int nsig = CudaKernels::flaggedIndicesOnDevice(Mcoarse_significant, sig_idx, sig_stream);
+                    std::vector<int> h_idx(nsig);
+                    if (nsig > 0)
+                    {
+                        DEBUG_HANDLE_ERROR(cudaMemcpyAsync(h_idx.data(), ~sig_idx, nsig * sizeof(int), cudaMemcpyDeviceToHost, sig_stream));
+                        DEBUG_HANDLE_ERROR(cudaStreamSynchronize(sig_stream));
+                    }
+                    bool *mask = &op.Mcoarse_significant.data[offset];
+                    memset(mask, 0, ipart_length * sizeof(bool));
+                    for (int i = 0; i < nsig; i++)
+                        mask[h_idx[i]] = true;
+                    if (sig_compact == 2)
+                    {
+                        std::vector<bool> compact(mask, mask + ipart_length);
+                        Mcoarse_significant.cpToHost();  // the full mask, into the same host array
+                        DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
+                        bool same = true;
+                        for (unsigned long i = 0; i < ipart_length; i++)
+                            if (compact[i] != mask[i]) { same = false; break; }
+                        sig_compact_totals.checked++;
+                        sig_compact_totals.entries += (long long) ipart_length;
+                        sig_compact_totals.significant += nsig;
+                        if (!same) sig_compact_totals.mismatched++;
+                    }
+                }
+                else
+                    Mcoarse_significant.cpToHost();
                 DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
 #elif defined(_SYCL_ENABLED) && defined(USE_ONEDPL)
 				unsorted_ipart.cpToHost();
