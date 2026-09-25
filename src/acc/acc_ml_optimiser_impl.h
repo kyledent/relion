@@ -2,6 +2,89 @@ static omp_lock_t global_mutex;
 
 #include "src/acc/acc_operand_dump.h"
 
+#if defined(_CUDA_ENABLED) && defined(__CUDACC__)
+#include "src/acc/cuda/cuda_coarse_gemm.cuh"
+
+// The coarse scores of one image and class as a GEMM (cuda_coarse_gemm.cuh), added into diff2s in the
+// kernel's layout. Returns false, having done nothing, if the class's matrix does not fit; the caller
+// then runs the kernel.
+template <class MlClass>
+static bool coarseGemmScores(
+		MlClass *accMLO,
+		AccPtrFactory &ptrFactory,
+		int iclass,
+		int iter,
+		AccProjectorKernel &projKernel,
+		XFLOAT *d_eulers,
+		size_t orientation_num,
+		XFLOAT *trans_x,
+		XFLOAT *trans_y,
+		XFLOAT *corr,    // corr, img_re, img_im: in runDiff2KernelCoarse's order
+		XFLOAT *img_re,
+		XFLOAT *img_im,
+		size_t translation_num,
+		size_t image_size,
+		XFLOAT *diff2s,
+		cudaStream_t stream)
+{
+	CoarseGemmCache &cache = accMLO->bundle->coarseGemm;
+	const size_t K = 3 * image_size + 1;
+	const size_t ld = (K + 31) / 32 * 32;
+	XFLOAT *R = NULL;
+	{
+		std::lock_guard<std::mutex> lock(cache.mutex);
+		if (!cache.entries.empty() && cache.entries[0].iter != iter)
+			cache.release(accMLO->bundle->allocator);  // a bundle kept across iterations: references changed
+		for (CoarseGemmCache::Entry &e : cache.entries)
+			if (e.iclass == iclass && e.imgX == projKernel.imgX && e.imgY == projKernel.imgY &&
+			    e.image_size == image_size && e.orientation_num == orientation_num)
+				R = e.R;
+		if (R == NULL)
+		{
+			if (cache.disabled)
+				return false;
+			const size_t bytes = orientation_num * ld * sizeof(XFLOAT);
+			if (bytes > accMLO->bundle->allocator->getLargestContinuousFreeSpace() / 4)
+			{
+				cache.disabled = true;
+				return false;
+			}
+			CudaCustomAllocator::Alloc *a = accMLO->bundle->allocator->alloc(bytes);
+			R = (XFLOAT *) a->getPtr();
+			CoarseGemm::cuda_kernel_coarse_gemm_R<<<orientation_num, COARSE_GEMM_BLOCK, 0, stream>>>(
+					d_eulers, projKernel, R, (int) image_size, ld);
+			LAUNCH_HANDLE_ERROR(cudaGetLastError());
+			// Other threads read it on their own streams.
+			HANDLE_ERROR(cudaStreamSynchronize(stream));
+			cache.entries.push_back({iclass, projKernel.imgX, projKernel.imgY, iter, image_size,
+			                         orientation_num, ld, a, R});
+		}
+	}
+
+	AccPtr<XFLOAT> Q = ptrFactory.make<XFLOAT>(translation_num * ld);
+	Q.setStream(stream);
+	Q.deviceAlloc();
+	CoarseGemm::cuda_kernel_coarse_gemm_Q<<<translation_num, COARSE_GEMM_BLOCK, 0, stream>>>(
+			trans_x, trans_y, img_re, img_im, corr, projKernel, ~Q, (int) image_size, ld);
+	LAUNCH_HANDLE_ERROR(cudaGetLastError());
+
+	cublasHandle_t &h = accMLO->coarseGemmHandle;
+	if (h == NULL)
+	{
+		CoarseGemm::handleCublas(cublasCreate(&h), "create");
+		if (CoarseGemm::mode() == 2)
+			CoarseGemm::handleCublas(cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH), "set TF32 math");
+	}
+	CoarseGemm::handleCublas(cublasSetStream(h, stream), "set stream");
+	// diff2s[o * T + t] += sum_k Q[t][k] R[o][k]: column-major C (T x O) += Q^T (T x K) R (K x O).
+	const float one = 1.f;
+	CoarseGemm::handleCublas(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
+			(int) translation_num, (int) orientation_num, (int) K,
+			&one, ~Q, (int) ld, R, (int) ld, &one, diff2s, (int) translation_num), "sgemm");
+	return true;
+}
+#endif
+
 #ifdef CC_WEIGHTS_SELFCHECK
 // Self-check of the CC coarse significance, built only with -DCC_WEIGHTS_SELFCHECK: repeat the
 // original host copy of the weights and its threshold loop over the scored entries, and count any
@@ -1401,6 +1484,61 @@ void getAllSquaredDifferencesCoarse(
 						op.local_Minvsigma2.zdim,
 						op.local_Minvsigma2.xdim-1);
 
+				bool gemmDone = false;
+#if defined(_CUDA_ENABLED) && defined(__CUDACC__)
+				// A global 3D search of 2D images: the coarse scores as one GEMM (cuda_coarse_gemm.cuh).
+				if (CoarseGemm::mode() > 0 && !do_CC && accMLO->refIs3D && !accMLO->dataIs3D &&
+				    !accMLO->generateProjectionPlanOnTheFly && sp.nr_images == 1 && baseMLO->mymodel.nr_bodies == 1)
+				{
+					AccProjectorPlan &plan = projectorPlans[iclass*sp.nr_images + img_id];
+					cudaStream_t stream = accMLO->classStreams[iclass];
+					if (CoarseGemm::checkCount() > 0 && CoarseGemm::totals.seen++ % CoarseGemm::checkCount() == 0)
+					{
+						CoarseGemm::totals.checked++;
+						// Check: both into zeroed buffers, compare, and keep the kernel's scores below.
+						const size_t n = plan.orientation_num * translation_num;
+						AccPtr<XFLOAT> dG = ptrFactory.make<XFLOAT>(n), dK = ptrFactory.make<XFLOAT>(n);
+						dG.setStream(stream); dK.setStream(stream);
+						dG.allAlloc(); dK.allAlloc();
+						deviceInitValue<XFLOAT>(dG, 0); deviceInitValue<XFLOAT>(dK, 0);
+						runDiff2KernelCoarse(projKernel, &(~trans_xyz)[trans_x_offset], &(~trans_xyz)[trans_y_offset],
+								&(~trans_xyz)[trans_z_offset], ~corr_img, &(~Fimg_)[img_re_offset], &(~Fimg_)[img_im_offset],
+								~plan.eulers, ~dK, (XFLOAT) op.local_sqrtXi2[img_id], plan.orientation_num,
+								translation_num, image_size, stream, do_CC, accMLO->dataIs3D);
+						if (coarseGemmScores(accMLO, ptrFactory, (int) iclass, baseMLO->iter, projKernel, ~plan.eulers,
+								plan.orientation_num, &(~trans_xyz)[trans_x_offset], &(~trans_xyz)[trans_y_offset],
+								~corr_img, &(~Fimg_)[img_re_offset], &(~Fimg_)[img_im_offset], translation_num,
+								image_size, ~dG, stream))
+						{
+							dG.cpToHost(); dK.cpToHost(); dK.streamSync();
+							double maxDiff = 0., maxK = 0., maxRel = 0.;
+							for (size_t i = 0; i < n; i++)
+							{
+								const double d = fabs((double) dG[i] - (double) dK[i]), k = fabs((double) dK[i]);
+								maxDiff = std::max(maxDiff, d);
+								maxK = std::max(maxK, k);
+								if (k > 0.) maxRel = std::max(maxRel, d / k);
+							}
+							printf("coarse-gemm-check iter %d class %d: %zu orientations x %lu translations, %lu pixels: "
+							       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e\n",
+							       baseMLO->iter, (int) iclass, (size_t) plan.orientation_num, translation_num,
+							       image_size, maxDiff, maxK, maxRel);
+							fflush(stdout);
+						}
+					}
+					else
+					{
+						gemmDone = coarseGemmScores(accMLO, ptrFactory, (int) iclass, baseMLO->iter, projKernel,
+								~plan.eulers, plan.orientation_num, &(~trans_xyz)[trans_x_offset],
+								&(~trans_xyz)[trans_y_offset], ~corr_img, &(~Fimg_)[img_re_offset],
+								&(~Fimg_)[img_im_offset], translation_num, image_size,
+								&(~allWeights)[allWeights_pos], stream);
+					}
+					if (gemmDone) CoarseGemm::totals.gemm++;
+					else CoarseGemm::totals.kernel++;
+				}
+#endif
+				if (!gemmDone)
                 runDiff2KernelCoarse(
 						projKernel,
 						&(~trans_xyz)[trans_x_offset], //~trans_x,
