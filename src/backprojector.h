@@ -358,7 +358,8 @@ public:
 			RFLOAT tau2_fudge=2,
 			RFLOAT min_resol_shell=0,
 			bool use_fsc=true,
-			bool printTimes=false);
+			bool printTimes=false,
+			bool do_gpu=false);  // the current reference's Fourier transform on the GPU (double cuFFT)
 
 	/*	Enforce Hermitian symmetry, apply helical symmetry as well as point-group symmetry
 	 */

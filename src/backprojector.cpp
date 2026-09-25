@@ -2002,7 +2002,8 @@ void BackProjector::reconstructGrad(
 		RFLOAT tau2_fudge,
 		RFLOAT min_resol_shell,
 		bool use_fsc,
-		bool printTimes)
+		bool printTimes,
+		bool do_gpu)
 {
 	const int max_r2 = ROUND(r_max * padding_factor) * ROUND(r_max * padding_factor);
 	RFLOAT oversampling_correction = (ref_dim == 3) ? (padding_factor * padding_factor * padding_factor) : (padding_factor * padding_factor);
@@ -2010,7 +2011,9 @@ void BackProjector::reconstructGrad(
 	// Calculate Fourier transform of the current reference in the same way as done in the E-step
 	MultidimArray<RFLOAT> dummy;
 	Projector PPref(ori_size, interpolator, padding_factor, r_min_nn, data_dim);
-	PPref.computeFourierTransformMap(vol_out, dummy, r_max*2, 1, false); // false means no gridding correction
+	// false means no gridding correction; with do_gpu the transform runs on the GPU as in the expectation's
+	// set-up, falling back to the CPU if the GPU has not enough free memory
+	PPref.computeFourierTransformMap(vol_out, dummy, r_max*2, 1, false, true, -1, NULL, do_gpu);
 
 //#define DEBUG_NGD
 #ifdef DEBUG_NGD
