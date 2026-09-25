@@ -3553,11 +3553,21 @@ void MlOptimiser::expectation()
 #endif
 
     // Initialise some stuff
+#ifdef TIMING
+    // Sub-steps of this (non-MPI) expectation, on the MPI path's timers: 1 set-up, 2 expected angular errors,
+    // 3 angular sampling and memory check, 4 GPU set-up (4a device bundles, 4b per-thread optimisers, 4c the
+    // allocators), 6 GPU teardown (7 back-projections read back and summed, 8 everything freed).
+    timer.tic(TIMING_EXP_1);
+#endif
     // A. Update current size (may have been changed to ori_size in autoAdjustAngularSampling) and resolution pointers
     updateImageSizeAndResolutionPointers();
 
     // B. Initialise Fouriertransform, set weights in wsum_model to zero, initialise AB-matrices for FFT-phase shifts, etc
     expectationSetup();
+#ifdef TIMING
+    timer.toc(TIMING_EXP_1);
+    timer.tic(TIMING_EXP_2);
+#endif
 
 #ifdef DEBUG_EXP
     std::cerr << "Expectation: done setup" << std::endl;
@@ -3576,6 +3586,10 @@ void MlOptimiser::expectation()
         getMetaAndImageDataSubset(0, n_trials_acc-1, false);
         calculateExpectedAngularErrors(0, n_trials_acc-1);
     }
+#ifdef TIMING
+    timer.toc(TIMING_EXP_2);
+    timer.tic(TIMING_EXP_3);
+#endif
 
     // D. Update the angular sampling (all nodes except leader)
     if ( ( (do_auto_refine || do_auto_sampling) && iter > 1) ||
@@ -3591,6 +3605,9 @@ void MlOptimiser::expectation()
 
     // E. Check whether everything fits into memory
     expectationSetupCheckMemory(verb);
+#ifdef TIMING
+    timer.toc(TIMING_EXP_3);
+#endif
 
 
 #ifdef DEBUG_EXP
@@ -3603,6 +3620,10 @@ void MlOptimiser::expectation()
 
     if (do_gpu)
     {
+#ifdef TIMING
+        timer.tic(TIMING_EXP_4);
+        timer.tic(TIMING_EXP_4a);
+#endif
         for (int i = 0; i < gpuDevices.size(); i ++)
         {
             MlDeviceBundle *b = new MlDeviceBundle(this);
@@ -3610,6 +3631,10 @@ void MlOptimiser::expectation()
             b->setupFixedSizedObjects();
             accDataBundles.push_back((void*)b);
         }
+#ifdef TIMING
+        timer.toc(TIMING_EXP_4a);
+        timer.tic(TIMING_EXP_4b);
+#endif
 
         std::vector<unsigned> threadcountOnDevice(accDataBundles.size(),0);
 
@@ -3622,6 +3647,10 @@ void MlOptimiser::expectation()
             gpuOptimisers.push_back((void*)b);
             threadcountOnDevice[gpuOptimiserDeviceMap[i]] ++;
         }
+#ifdef TIMING
+        timer.toc(TIMING_EXP_4b);
+        timer.tic(TIMING_EXP_4c);
+#endif
 
         int devCount;
         HANDLE_ERROR(accGPUGetDeviceCount(&devCount));
@@ -3659,6 +3688,10 @@ void MlOptimiser::expectation()
 
             ((MlDeviceBundle*)accDataBundles[i])->setupTunableSizedObjects(allocationSize);
         }
+#ifdef TIMING
+        timer.toc(TIMING_EXP_4c);
+        timer.toc(TIMING_EXP_4);
+#endif
     }
 #endif
 #ifdef _SYCL_ENABLED
@@ -3833,6 +3866,10 @@ void MlOptimiser::expectation()
 #if defined _CUDA_ENABLED || defined _HIP_ENABLED
     if (do_gpu)
     {
+#ifdef TIMING
+        timer.tic(TIMING_EXP_6);
+        timer.tic(TIMING_EXP_7);
+#endif
         for (int i = 0; i < accDataBundles.size(); i ++)
         {
             MlDeviceBundle* b = ((MlDeviceBundle*)accDataBundles[i]);
@@ -3867,6 +3904,10 @@ void MlOptimiser::expectation()
             for (int j = 0; j < b->coarseProjectionPlans.size(); j++)
                 b->coarseProjectionPlans[j].clear();
         }
+#ifdef TIMING
+        timer.toc(TIMING_EXP_7);
+        timer.tic(TIMING_EXP_8);
+#endif
 
         for (int i = 0; i < gpuOptimisers.size(); i ++)
             delete (MlOptimiserAccGPU*) gpuOptimisers[i];
@@ -3896,6 +3937,10 @@ void MlOptimiser::expectation()
             delete (MlDeviceBundle*) accDataBundles[i];
 
         accDataBundles.clear();
+#ifdef TIMING
+        timer.toc(TIMING_EXP_8);
+        timer.toc(TIMING_EXP_6);
+#endif
     }
 #endif
 #ifdef _SYCL_ENABLED
