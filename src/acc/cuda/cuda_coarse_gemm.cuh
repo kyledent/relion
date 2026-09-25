@@ -23,6 +23,11 @@
  * cross-correlation (1: fp32; 2: TF32 tensor cores). With RELION_COARSE_GEMM_CHECK=<n> as well, every
  * n-th eligible image and class is scored both ways, the largest difference is printed, and the
  * kernel's scores are kept for that one; all others use the GEMM.
+ *
+ * RELION_COARSE_GEMM_BATCH=<B> (B >= 2, with the GEMM on) scores B particles of one thread in one GEMM:
+ * each particle's translation columns side by side in Q, the product into a scratch matrix, and each
+ * particle's block added into its own weights (accDoExpectationParticleBatch). Threads then take tasks of
+ * B particles.
  */
 
 #include <cuda_runtime.h>
@@ -47,6 +52,12 @@ inline int mode()
 {
 	static const int m = getenv("RELION_COARSE_GEMM") ? atoi(getenv("RELION_COARSE_GEMM")) : 0;
 	return m;
+}
+
+inline int batch()
+{
+	static const int b = getenv("RELION_COARSE_GEMM_BATCH") ? atoi(getenv("RELION_COARSE_GEMM_BATCH")) : 1;
+	return b;
 }
 
 inline int checkCount()
@@ -131,15 +142,35 @@ static __global__ void cuda_kernel_coarse_gemm_Q(
 		col[3 * image_size] = s_sum[0];
 }
 
+// The product of a batch, C (column-major, nP * T rows by O columns: particle p's scores are rows
+// p * T ... p * T + T - 1), added into each particle's weights in the kernel's layout: dst[p][o * T + t].
+// Grid (O, number of particles), particles p0, p0 + 1, ...
+static __global__ void cuda_kernel_coarse_gemm_scatter(
+		const XFLOAT *C,
+		XFLOAT **dst,
+		int nP,
+		int T,
+		int p0)
+{
+	const size_t o = blockIdx.x;
+	const int p = p0 + blockIdx.y;
+	const size_t ldc = (size_t) nP * T;
+	XFLOAT *d = dst[blockIdx.y];
+	for (int t = threadIdx.x; t < T; t += blockDim.x)
+		d[o * T + t] += C[o * ldc + (size_t) p * T + t];
+}
+
 // Counts, printed by each process at exit when the GEMM path is enabled.
 struct Totals
 {
-	std::atomic<long long> gemm{0}, kernel{0}, checked{0}, seen{0};
+	std::atomic<long long> gemm{0}, kernel{0}, checked{0}, seen{0}, batches{0}, batched{0};
 	~Totals()
 	{
 		if (mode() > 0)
-			printf("coarse-gemm pid %d: %lld image-class scorings by GEMM (mode %d), %lld by the kernel, %lld checked\n",
-			       (int) getpid(), (long long) gemm, mode(), (long long) kernel, (long long) checked);
+			printf("coarse-gemm pid %d: %lld image-class scorings by GEMM (mode %d), %lld by the kernel, %lld checked; "
+			       "%lld batched GEMMs holding %lld image-class scorings (batch %d)\n",
+			       (int) getpid(), (long long) gemm, mode(), (long long) kernel, (long long) checked,
+			       (long long) batches, (long long) batched, batch());
 		fflush(stdout);
 	}
 };
