@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <mutex>
 
 #include "src/macros.h"
 #include "src/error.h"
@@ -113,13 +114,83 @@ public:
 		void doFreeWhenReady() { freeWhenReady = true; }
 	};
 
+	// Keeping the pool between allocators (RELION_KEEP_GPU_POOL=1). An allocator with keepPool set does not free
+	// its pool when cleared but leaves it for the next such allocator on the same device, which adopts it
+	// instead of allocating anew when the size fits. The device bundle's allocator is re-made every iteration,
+	// and allocating and freeing nearly the whole GPU costs about 0.1 s each time.
+	static bool keepPoolEnabled()
+	{
+		static const bool e = getenv("RELION_KEEP_GPU_POOL") != NULL && atoi(getenv("RELION_KEEP_GPU_POOL")) > 0;
+		return e;
+	}
+
+	// Bytes of this process's kept pool on a device (0 if none): memory it may count as free.
+	static size_t keptPoolBytes(int device)
+	{
+		std::lock_guard<std::mutex> lock(keptPoolsMutex());
+		for (KeptPool &k : keptPools())
+			if (k.device == device)
+				return k.size;
+		return 0;
+	}
+
+	void setKeepPool(bool keep) { keepPool = keep && keepPoolEnabled(); }
+
 private:
+
+	struct KeptPool { int device; void *ptr; size_t size; };
+	static std::vector<KeptPool> &keptPools() { static std::vector<KeptPool> v; return v; }
+	static std::mutex &keptPoolsMutex() { static std::mutex m; return m; }
+
+	// Adopt this device's kept pool if it is at least totalSize and at most KEEP_SLACK larger (a larger one
+	// would take memory the caller meant to leave free); otherwise free it. Returns whether first->ptr is set.
+	bool _adoptKeptPool()
+	{
+		const size_t KEEP_SLACK = (size_t) 256 * 1024 * 1024;
+		int device;
+		HANDLE_ERROR(cudaGetDevice(&device));
+		std::lock_guard<std::mutex> lock(keptPoolsMutex());
+		std::vector<KeptPool> &v = keptPools();
+		for (size_t i = 0; i < v.size(); i++)
+			if (v[i].device == device)
+			{
+				KeptPool k = v[i];
+				v.erase(v.begin() + i);
+				if (k.size >= totalSize && k.size - totalSize <= KEEP_SLACK)
+				{
+					first->ptr = (BYTE *) k.ptr;
+					first->size = totalSize = k.size;
+					return true;
+				}
+				DEBUG_HANDLE_ERROR(cudaFree(k.ptr));
+				return false;
+			}
+		return false;
+	}
+
+	// Leave the pool for the next allocator on this device (replacing any pool kept before).
+	void _keepPool()
+	{
+		int device;
+		HANDLE_ERROR(cudaGetDevice(&device));
+		std::lock_guard<std::mutex> lock(keptPoolsMutex());
+		std::vector<KeptPool> &v = keptPools();
+		for (size_t i = 0; i < v.size(); i++)
+			if (v[i].device == device)
+			{
+				DEBUG_HANDLE_ERROR(cudaFree(v[i].ptr));
+				v.erase(v.begin() + i);
+				break;
+			}
+		v.push_back({device, (void *) first->ptr, totalSize});
+	}
 
 	Alloc *first;
 	size_t totalSize;
 	size_t alignmentSize;
 
 	bool cache;
+	bool keepPool = false;
 
 	omp_lock_t mutex;
 
@@ -521,7 +592,8 @@ private:
 
 		if (totalSize > 0)
 		{
-			HANDLE_ERROR(cudaMalloc( (void**) &(first->ptr), totalSize));
+			if (!(keepPool && _adoptKeptPool()))
+				HANDLE_ERROR(cudaMalloc( (void**) &(first->ptr), totalSize));
 			cache = true;
 		}
 		else
@@ -531,7 +603,12 @@ private:
 	void _clear()
 	{
 		if (first->ptr != NULL)
-			DEBUG_HANDLE_ERROR(cudaFree( first->ptr ));
+		{
+			if (keepPool && totalSize > 0)
+				_keepPool();
+			else
+				DEBUG_HANDLE_ERROR(cudaFree( first->ptr ));
+		}
 
 		first->ptr = NULL;
 

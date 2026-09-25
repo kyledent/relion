@@ -3669,6 +3669,15 @@ void MlOptimiser::expectation()
             HANDLE_ERROR(accGPUMemGetInfo( &free, &total ));
 
             size_t required_free = requested_free_gpu_memory + GPU_THREAD_MEMORY_OVERHEAD_MB*1000*1000*threadcountOnDevice[i];
+#ifdef _CUDA_ENABLED
+            // A pool kept from the last iteration (RELION_KEEP_GPU_POOL) is this process's own: count it as free,
+            // and leave a margin for the next iteration's set-up, which runs while the pool is kept.
+            if (CudaCustomAllocator::keepPoolEnabled())
+            {
+                free += CudaCustomAllocator::keptPoolBytes(((MlDeviceBundle*)accDataBundles[i])->device_id);
+                required_free += (size_t) 512 * 1000 * 1000;
+            }
+#endif
 
             if (free < required_free)
             {
