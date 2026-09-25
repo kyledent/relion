@@ -5604,6 +5604,8 @@ void MlOptimiser::solventFlatten()
         {
             RFLOAT radius = (particle_diameter / (2. * mymodel.pixel_size));
             RFLOAT radius_p = radius + width_mask_edge;
+            // Every element is set on its own, so the threads give the same mask
+            #pragma omp parallel for num_threads(nr_threads)
             FOR_ALL_ELEMENTS_IN_ARRAY3D(Isolvent())
             {
                 RFLOAT r = sqrt((RFLOAT)(k * k + i * i + j * j));
@@ -5653,8 +5655,15 @@ void MlOptimiser::solventFlatten()
             lowPassFilterMap(Itmp, lowpass, mymodel.pixel_size);
         }
 
-        // Then apply the expanded solvent mask to the map
-        mymodel.Iref[iclass] *= Isolvent(); // this is the tight mask
+        // Then apply the expanded solvent mask to the map (element by element, so the same on any number of threads)
+        if (!mymodel.Iref[iclass].sameShape(Isolvent()))
+            mymodel.Iref[iclass] *= Isolvent(); // this is the tight mask; reports the mismatch
+        else
+        {
+            #pragma omp parallel for num_threads(nr_threads)
+            for (long int n = 0; n < MULTIDIM_SIZE(Isolvent()); n++)
+                DIRECT_MULTIDIM_ELEM(mymodel.Iref[iclass], n) *= DIRECT_MULTIDIM_ELEM(Isolvent(), n);
+        }
 
         if (fn_lowpass_mask != "None")
             mymodel.Iref[iclass] += Itmp;
