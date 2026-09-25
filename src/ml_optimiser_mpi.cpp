@@ -1219,6 +1219,15 @@ void MlOptimiserMpi::expectation()
 
 			free = (float) free / (float)gpuDeviceShares[i];
 			size_t required_free = requested_free_gpu_memory + GPU_THREAD_MEMORY_OVERHEAD_MB*1000*1000*threadcountOnDevice[i];
+#ifdef _CUDA_ENABLED
+			// A pool kept from the last iteration (RELION_KEEP_GPU_POOL) is this rank's own: count it as free (after the
+			// share, since every rank on the device keeps its own), and leave a margin for the next iteration's set-up.
+			if (CudaCustomAllocator::keepPoolEnabled())
+			{
+				free += CudaCustomAllocator::keptPoolBytes(((MlDeviceBundle*)accDataBundles[i])->device_id);
+				required_free += (size_t) 512 * 1000 * 1000;
+			}
+#endif
 
 			if (free < required_free)
 			{
