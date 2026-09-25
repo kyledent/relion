@@ -2714,6 +2714,10 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
                     memset(mask, 0, ipart_length * sizeof(bool));
                     for (int i = 0; i < nsig; i++)
                         mask[h_idx[i]] = true;
+                    op.Mcoarse_significant_idx.resize(nsig);
+                    for (int i = 0; i < nsig; i++)
+                        op.Mcoarse_significant_idx[i] = (long) offset + h_idx[i];
+                    op.Mcoarse_significant_idx_valid = true;
                     if (sig_compact == 2)
                     {
                         std::vector<bool> compact(mask, mask + ipart_length);
