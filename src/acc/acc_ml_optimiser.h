@@ -149,6 +149,9 @@ public:
 	std::vector<RFLOAT> highres_Xi2_img;
     RFLOAT min_diff2;
 	MultidimArray<bool> Mcoarse_significant;
+	// With RELION_SIG_COMPACT: the indices of Mcoarse_significant's set entries, in increasing order
+	std::vector<long> Mcoarse_significant_idx;
+	bool Mcoarse_significant_idx_valid = false;
 	// And from storeWeightedSums
 	RFLOAT sum_weight, significant_weight, max_weight;
 	std::vector<RFLOAT> sum_weight_class;
