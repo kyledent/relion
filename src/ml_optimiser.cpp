@@ -1785,7 +1785,7 @@ void MlOptimiser::initialise()
 
     grad_pseudo_halfsets = gradient_refine && !do_split_random_halves;
 
-#ifdef MKLFFT
+#if defined(MKLFFT) || defined(FFTW_THREADS)
     // Enable multi-threaded FFTW
     int success = fftw_init_threads();
     if (0 == success)
@@ -1793,7 +1793,7 @@ void MlOptimiser::initialise()
 
     // And allow plans before expectation to run using allowed
     // number of threads
-    fftw_plan_with_nthreads(nr_threads);
+    fftw_plan_with_nthreads(fftwPlanThreads(nr_threads));
 #endif
 
     initialiseGeneral();
@@ -3279,7 +3279,7 @@ void MlOptimiser::iterateWrapUp()
     if (!keep_scratch)
         mydata.deleteDataOnScratch();
 
-#ifdef MKLFFT
+#if defined(MKLFFT) || defined(FFTW_THREADS)
     fftw_cleanup_threads();
 #endif
 }
@@ -3547,9 +3547,9 @@ void MlOptimiser::expectation()
     std::cerr << "Entering expectation" << std::endl;
 #endif
 
-#ifdef MKLFFT
+#if defined(MKLFFT) || defined(FFTW_THREADS)
     // Allow parallel FFTW execution
-    fftw_plan_with_nthreads(nr_threads);
+    fftw_plan_with_nthreads(fftwPlanThreads(nr_threads));
 #endif
 
     // Initialise some stuff
@@ -3733,7 +3733,7 @@ void MlOptimiser::expectation()
 #endif // ALTCPU
     /************************************************************************/
 
-#ifdef MKLFFT
+#if defined(MKLFFT) || defined(FFTW_THREADS)
     // Single-threaded FFTW execution for code inside parallel processing loop
     fftw_plan_with_nthreads(1);
 #endif
@@ -3992,10 +3992,10 @@ void MlOptimiser::expectation()
         tbbCpuOptimiser.clear();
     }
 #endif  // ALTCPU
-#ifdef  MKLFFT
+#if defined(MKLFFT) || defined(FFTW_THREADS)
     // Allow parallel FFTW execution to continue now that we are outside the parallel
     // portion of expectation
-    fftw_plan_with_nthreads(nr_threads);
+    fftw_plan_with_nthreads(fftwPlanThreads(nr_threads));
 #endif
 
     // Clean up some memory

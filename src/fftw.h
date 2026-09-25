@@ -47,6 +47,7 @@
 #define __RELIONFFTW_H
 
 #include <fftw3.h>
+#include <cstdlib>
 #include "src/multidim_array.h"
 #include "src/funcs.h"
 #include "src/tabfuncs.h"
@@ -96,6 +97,16 @@
  * }
  * @endcode
  */
+#if defined(MKLFFT) || defined(FFTW_THREADS)
+// Threads for FFTW plans made outside the parallel expectation loop (the maximisation and set-up): the
+// run's thread count, or RELION_FFTW_THREADS if that is set (e.g. 1, to compare with serial transforms).
+inline int fftwPlanThreads(int nr_threads)
+{
+	const char *e = getenv("RELION_FFTW_THREADS");
+	return (e != NULL && atoi(e) > 0) ? atoi(e) : nr_threads;
+}
+#endif
+
 #define FOR_ALL_ELEMENTS_IN_FFTW_TRANSFORM(V) \
 	for (long int k = 0, kp = 0; k<ZSIZE(V); k++, kp = (k < XSIZE(V)) ? k : k - ZSIZE(V)) \
 		for (long int i = 0, ip = 0 ; i<YSIZE(V); i++, ip = (i < XSIZE(V)) ? i : i - YSIZE(V)) \

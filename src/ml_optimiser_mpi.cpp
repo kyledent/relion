@@ -730,7 +730,7 @@ will still yield good performance and possibly a more stable execution. \n" << s
 		fn_ref.getHalf(fn_ref, my_halfset);
 	}
 
-#ifdef MKLFFT
+#if defined(MKLFFT) || defined(FFTW_THREADS)
 	// Enable multi-threaded FFTW
 	int success = fftw_init_threads();
 	if (0 == success)
@@ -738,7 +738,7 @@ will still yield good performance and possibly a more stable execution. \n" << s
 
 	// And allow plans before expectation to run using allowed
 	// number of threads
-	fftw_plan_with_nthreads(nr_threads);
+	fftw_plan_with_nthreads(fftwPlanThreads(nr_threads));
 #endif
 
 	MlOptimiser::initialiseGeneral(node->rank);
@@ -1001,9 +1001,9 @@ void MlOptimiserMpi::expectation()
 	n_trials_acc = XMIPP_MIN(n_trials_acc, mydata.numberOfParticles());
 	MPI_Status status;
 
-#ifdef MKLFFT
+#if defined(MKLFFT) || defined(FFTW_THREADS)
 	// Allow parallel FFTW execution
-	fftw_plan_with_nthreads(nr_threads);
+	fftw_plan_with_nthreads(fftwPlanThreads(nr_threads));
 #endif
 
 	// Initialise some stuff
@@ -1337,7 +1337,7 @@ void MlOptimiserMpi::expectation()
 #endif // ALTCPU
 	/************************************************************************/
 
-#ifdef MKLFFT
+#if defined(MKLFFT) || defined(FFTW_THREADS)
 	// Single-threaded FFTW execution for code inside parallel processing loop
 	fftw_plan_with_nthreads(1);
 #endif
@@ -1883,10 +1883,10 @@ void MlOptimiserMpi::expectation()
 #endif
 	}  // Follower node
 
-#ifdef  MKLFFT
+#if defined(MKLFFT) || defined(FFTW_THREADS)
 	// Allow parallel FFTW execution to continue now that we are outside the parallel
 	// portion of expectation
-	fftw_plan_with_nthreads(nr_threads);
+	fftw_plan_with_nthreads(fftwPlanThreads(nr_threads));
 #endif
 
 	// Just make sure the temporary arrays are empty...
