@@ -1,6 +1,8 @@
 #ifndef CUDA_SHORTCUTS_CUH_
 #define CUDA_SHORTCUTS_CUH_
 
+#include "src/acc/cuda/cuda_pinned_upload.h"
+
 namespace CudaShortcuts
 {
 
@@ -29,6 +31,9 @@ template< typename T>
 static inline
 void cpyHostToDevice( T *h_ptr, T *d_ptr, size_t size, cudaStream_t stream)
 {
+	// RELION_PINNED_UPLOAD=1: small uploads through a pinned ring (cuda_pinned_upload.h)
+	if (PinnedUpload::enabled() && PinnedUpload::upload(h_ptr, d_ptr, size * sizeof(T), stream))
+		return;
 	DEBUG_HANDLE_ERROR(cudaMemcpyAsync( d_ptr, h_ptr, size * sizeof(T), cudaMemcpyHostToDevice, stream));
 };
 
