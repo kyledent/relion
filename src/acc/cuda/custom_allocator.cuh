@@ -191,6 +191,10 @@ private:
 
 	bool cache;
 	bool keepPool = false;
+	// An allocator over a region it does not own (see the region constructor): it never allocates or frees the
+	// region itself, and what does not fit is taken from fallback.
+	bool external = false;
+	CudaCustomAllocator *fallback = NULL;
 
 	omp_lock_t mutex;
 
@@ -602,7 +606,7 @@ private:
 
 	void _clear()
 	{
-		if (first->ptr != NULL)
+		if (first->ptr != NULL && !external)
 		{
 			if (keepPool && totalSize > 0)
 				_keepPool();
@@ -629,6 +633,24 @@ public:
 	{
 		_setup();
 
+		omp_init_lock(&mutex);
+		omp_init_lock(&eventPoolMutex);
+	}
+
+	// An allocator over a region of device memory owned by someone else (e.g. a block of another allocator), so
+	// that one thread's short-lived blocks do not share the other allocator's lock and list. A request that does
+	// not fit in the region is passed to fallback, and blocks from fallback are handed back to it by free().
+	CudaCustomAllocator(BYTE *region, size_t size, size_t alignmentSize, CudaCustomAllocator *fallback):
+		totalSize(size), alignmentSize(alignmentSize), first(0), cache(true)
+	{
+		external = true;
+		this->fallback = fallback;
+		first = new Alloc(this);
+		first->prev = NULL;
+		first->next = NULL;
+		first->size = totalSize;
+		first->free = true;
+		first->ptr = region;
 		omp_init_lock(&mutex);
 		omp_init_lock(&eventPoolMutex);
 	}
@@ -669,6 +691,10 @@ public:
 			size = alignmentSize*ceilf( (float)size / (float)alignmentSize) ; //To prevent miss-aligned memory
 
 			Alloc *curAlloc = _getFirstSuitedFree(size);
+
+			// Over a borrowed region: what does not fit comes from the fallback allocator (its owner frees it)
+			if (curAlloc == NULL && fallback != NULL)
+				return fallback->alloc(requestedSize);
 
 			//If out of memory
 			if (curAlloc == NULL)
@@ -781,6 +807,11 @@ public:
 
 	void free(Alloc* a)
 	{
+		if (a->owner != this)  // a block from the fallback allocator
+		{
+			a->owner->free(a);
+			return;
+		}
 		CCA_LOCK;
 		_free(a);
 	}

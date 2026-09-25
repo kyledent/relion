@@ -271,12 +271,26 @@ void MlOptimiserCuda::doThreadExpectationSomeParticles(int thread_id)
 	//put mweight allocation here
 	size_t first_ipart = 0, last_ipart = 0;
 
+	// RELION_THREAD_ALLOC_MB=<n>: this call's per-particle blocks come from an allocator of its own over an n MB
+	// block of the bundle's, so the threads do not share the allocator's lock, list and event pool. What does not
+	// fit comes from the bundle's allocator. The block is given back when the call ends.
+	static const size_t thread_alloc_mb = getenv("RELION_THREAD_ALLOC_MB") != NULL ? (size_t) atol(getenv("RELION_THREAD_ALLOC_MB")) : 0;
+	CudaCustomAllocator *callAllocator = allocator;
+	CudaCustomAllocator::Alloc *callSlice = NULL;
+	if (thread_alloc_mb > 0 && allocator->getLargestContinuousFreeSpace() > 4 * (thread_alloc_mb << 20))
+	{
+		int alignment;
+		cudaDeviceGetAttribute(&alignment, cudaDevAttrTextureAlignment, device_id);
+		callSlice = allocator->alloc(thread_alloc_mb << 20);
+		callAllocator = new CudaCustomAllocator(callSlice->getPtr(), callSlice->getSize(), alignment, allocator);
+	}
+
 	while (baseMLO->exp_ipart_ThreadTaskDistributor->getTasks(first_ipart, last_ipart))
 	{
 		// Several particles at once with the coarse pass as one GEMM (RELION_COARSE_GEMM_BATCH).
 		if (last_ipart > first_ipart && coarseGemmBatchEligible(this))
 		{
-			AccPtrFactory ptrFactory(allocator, cudaStreamPerThread);
+			AccPtrFactory ptrFactory(callAllocator, cudaStreamPerThread);
 			accDoExpectationParticleBatch<MlOptimiserCuda>(this, baseMLO->exp_my_first_part_id + first_ipart,
 					baseMLO->exp_my_first_part_id + last_ipart, thread_id, ptrFactory);
 			continue;
@@ -290,7 +304,7 @@ void MlOptimiserCuda::doThreadExpectationSomeParticles(int thread_id)
 		baseMLO->timer.tic(baseMLO->TIMING_ESP_DIFF2_A);
 #endif
 
-			AccPtrFactory ptrFactory(allocator, cudaStreamPerThread);
+			AccPtrFactory ptrFactory(callAllocator, cudaStreamPerThread);
             accDoExpectationOneParticle<MlOptimiserCuda>(this, baseMLO->exp_my_first_part_id + ipart, thread_id, ptrFactory);
 
 		}
@@ -299,6 +313,26 @@ void MlOptimiserCuda::doThreadExpectationSomeParticles(int thread_id)
 
 //	CTIC(cudaMLO->timer,"interParticle");
 //	exit(0);
+
+	if (callSlice != NULL)
+	{
+		// Wait for this thread's work, settle its deferred frees, and give the block back. If a block were still
+		// in use (not expected: the factories above are gone), the allocator and its block are left alone.
+		HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
+		for (size_t i = 0; i < classStreams.size(); i++)
+			if (classStreams[i] != NULL)
+				HANDLE_ERROR(cudaStreamSynchronize(classStreams[i]));
+		callAllocator->syncReadyEvents();
+		callAllocator->freeReadyAllocs();
+		if (callAllocator->getTotalUsedSpace() == 0)
+		{
+			delete callAllocator;
+			allocator->free(callSlice);
+		}
+		else
+			printf("WARNING: a thread allocator still holds %lu bytes at the end of its expectation; it is kept\n",
+			       (unsigned long) callAllocator->getTotalUsedSpace());
+	}
 
 #ifdef TIMING
 	// Only time one thread
