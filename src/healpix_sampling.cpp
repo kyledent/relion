@@ -18,6 +18,7 @@
  * author citations must be preserved.
  ***************************************************************************/
 #include "src/healpix_sampling.h"
+#include <cstring>
 //#define DEBUG_SAMPLING
 //#define DEBUG_CHECKSIZES
 //#define DEBUG_HELICAL_ORIENTATIONAL_SEARCH
@@ -692,6 +693,64 @@ RFLOAT HealpixSampling::calculateDeltaRot(Matrix1D<RFLOAT> my_direction, RFLOAT 
 	return fabs(ASIND(my_rot_direction(1)));
 }
 
+namespace
+{
+// Bitwise equality: the cache must be rebuilt for any change at all, including -0.0 against 0.0.
+bool sameBits(const std::vector<RFLOAT> &a, const std::vector<RFLOAT> &b)
+{
+	return a.size() == b.size() && (a.empty() || memcmp(a.data(), b.data(), a.size() * sizeof(RFLOAT)) == 0);
+}
+
+bool sameBits(const std::vector <Matrix2D<RFLOAT> > &a, const std::vector <Matrix2D<RFLOAT> > &b)
+{
+	if (a.size() != b.size())
+		return false;
+	for (size_t i = 0; i < a.size(); i++)
+		if (MAT_XSIZE(a[i]) != MAT_XSIZE(b[i]) || MAT_YSIZE(a[i]) != MAT_YSIZE(b[i]) ||
+		    memcmp(MATRIX2D_ARRAY(a[i]), MATRIX2D_ARRAY(b[i]), MAT_XSIZE(a[i]) * MAT_YSIZE(a[i]) * sizeof(RFLOAT)) != 0)
+			return false;
+	return true;
+}
+}
+
+std::shared_ptr<const HealpixSampling::DirectionCache> HealpixSampling::directionCache()
+{
+	std::shared_ptr<const DirectionCache> c;
+	{
+		std::lock_guard<std::mutex> lock(direction_cache.mutex);
+		c = direction_cache.cache;
+	}
+	auto current = [&](const std::shared_ptr<const DirectionCache> &x)
+	{
+		return x && sameBits(x->rot, rot_angles) && sameBits(x->tilt, tilt_angles)
+		         && sameBits(x->R, R_repository) && sameBits(x->L, L_repository);
+	};
+	if (current(c))
+		return c;
+
+	std::lock_guard<std::mutex> lock(direction_cache.mutex);
+	if (current(direction_cache.cache))   // another thread may have rebuilt it meanwhile
+		return direction_cache.cache;
+
+	// The same expressions the per-particle loop used, so every value is bit-identical.
+	std::shared_ptr<DirectionCache> fresh = std::make_shared<DirectionCache>();
+	fresh->rot = rot_angles;
+	fresh->tilt = tilt_angles;
+	fresh->R = R_repository;
+	fresh->L = L_repository;
+	fresh->dir.resize(rot_angles.size());
+	fresh->sym.reserve(rot_angles.size() * R_repository.size());
+	for (long int idir = 0; idir < rot_angles.size(); idir++)
+	{
+		Matrix1D<RFLOAT> &my_direction = fresh->dir[idir];
+		Euler_angles2direction(rot_angles[idir], tilt_angles[idir], my_direction);
+		for (int j = 0; j < R_repository.size(); j++)
+			fresh->sym.push_back(L_repository[j] * (my_direction.transpose() * R_repository[j]).transpose());
+	}
+	direction_cache.cache = fresh;
+	return fresh;
+}
+
 void HealpixSampling::selectOrientationsWithNonZeroPriorProbability(
 		RFLOAT prior_rot, RFLOAT prior_tilt, RFLOAT prior_psi,
 		RFLOAT sigma_rot, RFLOAT sigma_tilt, RFLOAT sigma_psi,
@@ -722,6 +781,17 @@ void HealpixSampling::selectOrientationsWithNonZeroPriorProbability(
 		RFLOAT best_ang = 9999.;
 		long int best_idir = -999;
 
+		// For priors on both rot and tilt: the prior's direction, and the cached vectors of all
+		// directions and their symmetry mates (the part that does not depend on the particle).
+		std::shared_ptr<const DirectionCache> dirs;
+		Matrix1D<RFLOAT> prior_direction;
+		if ( (sigma_rot > 0.) && (sigma_tilt > 0.) )
+		{
+			dirs = directionCache();
+			Euler_angles2direction(prior_rot, prior_tilt, prior_direction);
+		}
+		const int nsym = R_repository.size();
+
 		for (long int idir = 0; idir < rot_angles.size(); idir++)
 		{
 			// Check if this direction was met before as symmetry mate
@@ -733,32 +803,28 @@ void HealpixSampling::selectOrientationsWithNonZeroPriorProbability(
 			// Any prior involving BOTH rot and tilt.
 			if ( (sigma_rot > 0.) && (sigma_tilt > 0.) )
 			{
-				// Get the direction of the prior
-				Matrix1D<RFLOAT> prior_direction, my_direction, sym_direction, best_direction;
-				Euler_angles2direction(prior_rot, prior_tilt, prior_direction);
-
-				// Get the current direction in the loop
-				Euler_angles2direction(rot_angles[idir], tilt_angles[idir], my_direction);
-				best_direction = my_direction;
+				// The current direction in the loop
+				const Matrix1D<RFLOAT> &my_direction = dirs->dir[idir];
+				const Matrix1D<RFLOAT> *best_direction = &my_direction;
 
 				// Loop over all symmetry operators to find the operator that brings this direction nearest to the prior if no symmetry relaxation
 				if (!isRelax)
 				{
 					RFLOAT best_dotProduct = dotProduct(prior_direction, my_direction);
-					for (int j = 0; j < R_repository.size(); j++)
+					for (int j = 0; j < nsym; j++)
 					{
-						sym_direction =  L_repository[j] * (my_direction.transpose() * R_repository[j]).transpose();
+						const Matrix1D<RFLOAT> &sym_direction = dirs->sym[idir * nsym + j];
 						RFLOAT my_dotProduct = dotProduct(prior_direction, sym_direction);
 						if (my_dotProduct > best_dotProduct)
 						{
-							best_direction = sym_direction;
+							best_direction = &sym_direction;
 							best_dotProduct = my_dotProduct;
 						}
 					}
 				}
 
 				// Now that we have the best direction, find the corresponding prior probability
-				RFLOAT diffang = ACOSD( dotProduct(best_direction, prior_direction) );
+				RFLOAT diffang = ACOSD( dotProduct(*best_direction, prior_direction) );
 				if (diffang > 180.)
 					diffang = ABS(diffang - 360.);
 				if (do_bimodal_search_psi && (diffang > 90.))  // KThurber
