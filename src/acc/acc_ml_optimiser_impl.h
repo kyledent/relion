@@ -7,6 +7,25 @@ static omp_lock_t global_mutex;
 
 // RELION_SIG_COMPACT (convertAllSquaredDifferencesToWeights, CUDA): 1 copies back only the indices of the coarse
 // pass's significant samples; 2 does that and the full copy, compares them, and prints the totals at exit.
+// RELION_PDF_CACHE=2 (convertAllSquaredDifferencesToWeights): the rebuilt orientation prior against the cached one.
+struct PdfCacheCheckTotals
+{
+	std::atomic<long long> checked{0}, differ{0};
+	void record(bool same) { checked++; if (!same) differ++; }
+	~PdfCacheCheckTotals()
+	{
+		if (checked > 0)
+			printf("pdf-cache-check pid %d: %lld priors compared with the cache, %lld differ\n", (int)getpid(),
+			       (long long)checked, (long long)differ);
+		fflush(stdout);
+	}
+};
+inline PdfCacheCheckTotals &pdfCacheCheck()
+{
+	static PdfCacheCheckTotals t;
+	return t;
+}
+
 struct SigCompactTotals
 {
 	std::atomic<long long> checked{0}, mismatched{0}, entries{0}, significant{0};
@@ -2293,6 +2312,39 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
 
 	// pdf_orientation is img_id-independent, so we keep it above img_id scope
 	CTIC(accMLO->timer,"get_orient_priors");
+#ifdef _CUDA_ENABLED
+	// RELION_PDF_CACHE=1: without orientational priors (or with the alignment skipped) the orientation prior is the
+	// same for every particle of an iteration, so each thread builds it once per iteration and reuses it. On a
+	// miss it is built as below and copied into this thread's cache, on this thread's stream.
+	// RELION_PDF_CACHE=2 never uses the cache: it builds the prior every time and, where the cache holds one with
+	// the same key, compares the two bit for bit (totals printed at exit).
+	static const int pdf_cache_mode = getenv("RELION_PDF_CACHE") != NULL ? atoi(getenv("RELION_PDF_CACHE")) : 0;
+	static const bool pdf_cache = pdf_cache_mode > 0;
+	struct PdfOrientCache { long key[9]; XFLOAT *d_pdf = NULL; bool *d_zeros = NULL; size_t cap = 0; int dev = -1; bool valid = false; };
+	thread_local PdfOrientCache pdf_cached;
+	bool pdf_cache_use = false;
+	long pdf_key[9] = {0};
+	const size_t pdf_n = (size_t)((sp.iclass_max-sp.iclass_min+1) * sp.nr_dir * sp.nr_psi);
+	if (pdf_cache && (baseMLO->do_skip_align || baseMLO->do_skip_rotate || baseMLO->mymodel.orientational_prior_mode == NOPRIOR))
+	{
+		int device = -1;
+		HANDLE_ERROR(cudaGetDevice(&device));
+		const long k[9] = {(long) baseMLO->iter, (long) device, (long) sp.iclass_min, (long) sp.iclass_max, (long) sp.nr_dir,
+		                   (long) sp.nr_psi, (long) sp.idir_min, (long) sp.ipsi_min,
+		                   (long) ((baseMLO->do_skip_align ? 1 : 0) + (baseMLO->do_skip_rotate ? 2 : 0))};
+		memcpy(pdf_key, k, sizeof(k));
+		pdf_cache_use = true;
+		if (pdf_cache_mode == 1 && pdf_cached.valid && memcmp(pdf_cached.key, pdf_key, sizeof(pdf_key)) == 0 && pdf_cached.cap >= pdf_n)
+		{
+			pdf_orientation.freeIfSet();
+			pdf_orientation_zeros.freeIfSet();
+			pdf_orientation.setAccPtr(pdf_cached.d_pdf);
+			pdf_orientation_zeros.setAccPtr(pdf_cached.d_zeros);
+			goto pdf_orientation_ready;
+		}
+	}
+#endif
+	{
 	AccPtr<RFLOAT> pdfs				= ptrFactory.make<RFLOAT>((size_t)((sp.iclass_max-sp.iclass_min+1) * sp.nr_dir * sp.nr_psi));
 	pdfs.allAlloc();
 
@@ -2317,6 +2369,44 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
 #if defined(_SYCL_ENABLED) && defined(USE_ONEDPL)
 	pdf_orientation.cpToDevice();
 	pdf_orientation_zeros.cpToDevice();
+#endif
+#ifdef _CUDA_ENABLED
+	if (pdf_cache_use && pdf_cache_mode == 2 && pdf_cached.valid && memcmp(pdf_cached.key, pdf_key, sizeof(pdf_key)) == 0
+	    && pdf_cached.cap >= pdf_n)
+	{
+		std::vector<XFLOAT> a(pdf_n), b(pdf_n);
+		std::vector<char> za(pdf_n), zb(pdf_n);
+		HANDLE_ERROR(cudaStreamSynchronize(pdf_orientation.getStream()));
+		HANDLE_ERROR(cudaMemcpy(a.data(), ~pdf_orientation, pdf_n * sizeof(XFLOAT), cudaMemcpyDeviceToHost));
+		HANDLE_ERROR(cudaMemcpy(b.data(), pdf_cached.d_pdf, pdf_n * sizeof(XFLOAT), cudaMemcpyDeviceToHost));
+		HANDLE_ERROR(cudaMemcpy(za.data(), ~pdf_orientation_zeros, pdf_n * sizeof(bool), cudaMemcpyDeviceToHost));
+		HANDLE_ERROR(cudaMemcpy(zb.data(), pdf_cached.d_zeros, pdf_n * sizeof(bool), cudaMemcpyDeviceToHost));
+		pdfCacheCheck().record(memcmp(a.data(), b.data(), pdf_n * sizeof(XFLOAT)) == 0 && za == zb);
+	}
+	else if (pdf_cache_use)
+	{
+		if (pdf_cached.cap < pdf_n || pdf_cached.dev != (int) pdf_key[1])
+		{
+			// buffers on another device (this thread served another GPU before) are left, not freed from here
+			if (pdf_cached.dev == (int) pdf_key[1])
+			{
+				if (pdf_cached.d_pdf != NULL) HANDLE_ERROR(cudaFree(pdf_cached.d_pdf));
+				if (pdf_cached.d_zeros != NULL) HANDLE_ERROR(cudaFree(pdf_cached.d_zeros));
+			}
+			HANDLE_ERROR(cudaMalloc((void **) &pdf_cached.d_pdf, pdf_n * sizeof(XFLOAT)));
+			HANDLE_ERROR(cudaMalloc((void **) &pdf_cached.d_zeros, pdf_n * sizeof(bool)));
+			pdf_cached.cap = pdf_n;
+			pdf_cached.dev = (int) pdf_key[1];
+		}
+		HANDLE_ERROR(cudaMemcpyAsync(pdf_cached.d_pdf, ~pdf_orientation, pdf_n * sizeof(XFLOAT), cudaMemcpyDeviceToDevice, pdf_orientation.getStream()));
+		HANDLE_ERROR(cudaMemcpyAsync(pdf_cached.d_zeros, ~pdf_orientation_zeros, pdf_n * sizeof(bool), cudaMemcpyDeviceToDevice, pdf_orientation_zeros.getStream()));
+		memcpy(pdf_cached.key, pdf_key, sizeof(pdf_key));
+		pdf_cached.valid = true;
+	}
+#endif
+	}
+#ifdef _CUDA_ENABLED
+pdf_orientation_ready:
 #endif
 	CTOC(accMLO->timer,"get_orient_priors");
 
