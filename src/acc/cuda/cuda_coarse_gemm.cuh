@@ -10,8 +10,11 @@
  * shifted by translation t. Expanded, that is
  *     sum_p c_p |r_op|^2  -  2 sum_p c_p (Re r_op Re x_tp + Im r_op Im x_tp)  +  sum_p c_p |x_tp|^2,
  * the product of
- *     R[o] = [ Re r_o | Im r_o | |r_o|^2 | 1 ]                         (3P + 1 values)
- *     Q[t] = [ -2 c Re x_t | -2 c Im x_t | c | sum_p c_p |x_tp|^2 ]   (3P + 1 values).
+ *     R[o] = [ Re r_o | Im r_o | |r_o|^2 | 1 | 1 ]                        (3P + 2 values)
+ *     Q[t] = [ -2 c Re x_t | -2 c Im x_t | c | s_t hi | s_t lo ]         (3P + 2 values),
+ * with s_t = sum_p c_p |x_tp|^2 split into a part with only TF32's 10 mantissa bits (hi) and the rest
+ * (lo). s_t is most of each score, so in TF32 mode a single rounding of it would offset all of a
+ * translation's scores by up to 1 part in 2^11; split, both parts pass through TF32 almost exactly.
  * In a global search every particle uses the same orientations, so R is built once per class and
  * image size per iteration, and each particle only builds Q (T columns) and runs one GEMM that adds
  * Q^T R into the weights in their own layout (o * T + t).
@@ -66,7 +69,13 @@ inline int checkCount()
 	return n;
 }
 
-// R for one class and image size: row o (3P + 1 floats) = [Re r_o | Im r_o | |r_o|^2 | 1].
+// Columns of R and Q (K of the product).
+__host__ __device__ inline size_t kdim(size_t image_size)
+{
+	return 3 * image_size + 2;
+}
+
+// R for one class and image size: row o (3P + 2 floats) = [Re r_o | Im r_o | |r_o|^2 | 1 | 1].
 // One block per orientation; pixels indexed as in cuda_kernel_diff2_coarse.
 static __global__ void cuda_kernel_coarse_gemm_R(
 		XFLOAT *g_eulers,
@@ -95,10 +104,14 @@ static __global__ void cuda_kernel_coarse_gemm_R(
 		row[2 * image_size + p] = re * re + im * im;
 	}
 	if (threadIdx.x == 0)
+	{
 		row[3 * image_size] = (XFLOAT) 1.;
+		row[3 * image_size + 1] = (XFLOAT) 1.;
+	}
 }
 
-// Q for one particle: column t (3P + 1 floats) = [-2 c Re x_t | -2 c Im x_t | c | sum_p c_p |x_tp|^2],
+// Q for one particle: column t (3P + 2 floats) = [-2 c Re x_t | -2 c Im x_t | c | s_t hi | s_t lo],
+// s_t = sum_p c_p |x_tp|^2,
 // with x_t shifted by the kernel's own translatePixel. One block per translation.
 static __global__ void cuda_kernel_coarse_gemm_Q(
 		XFLOAT *trans_x,
@@ -139,7 +152,12 @@ static __global__ void cuda_kernel_coarse_gemm_Q(
 		__syncthreads();
 	}
 	if (threadIdx.x == 0)
-		col[3 * image_size] = s_sum[0];
+	{
+		const float s = s_sum[0];
+		const float hi = __uint_as_float(__float_as_uint(s) & 0xffffe000u);  // exact in TF32
+		col[3 * image_size] = hi;
+		col[3 * image_size + 1] = s - hi;  // exact in float
+	}
 }
 
 // The product of a batch, C (column-major, nP * T rows by O columns: particle p's scores are rows
