@@ -386,8 +386,9 @@ static void TranslateAndNormCorrect(MultidimArray<RFLOAT > &img_in,
 	for (unsigned long i = 0; i < img_in.nzyxdim; i++)
 		temp[i] = (XFLOAT) img_in.data[i];
 
+	// No sync needed: the copy is from pageable memory, so the source is consumed before cpToDevice
+	// returns, and the kernels below are queued on the same stream after it.
 	temp.cpToDevice();
-	temp.streamSync();
 
 	// Apply the norm_correction term
 	if (normcorr!=1)
@@ -442,6 +443,8 @@ void normalizeAndTransformImage(	AccPtr<XFLOAT> &img_in,
 									size_t ySize,
 									size_t zSize)
 {
+			// Everything here is queued on one stream (the per-thread stream of the image, the
+			// transformer and its cuFFT plan), so the host need only wait before it reads d_Fimg.
 			img_in.cpOnAcc(accMLO->transformer1.reals);
 			runCenterFFT(
 					accMLO->transformer1.reals,
@@ -450,9 +453,7 @@ void normalizeAndTransformImage(	AccPtr<XFLOAT> &img_in,
 					(int)accMLO->transformer1.zSize,
 					false
 					);
-			accMLO->transformer1.reals.streamSync();
 			accMLO->transformer1.forward();
-			accMLO->transformer1.fouriers.streamSync();
 
 			size_t FMultiBsize = ( (int) ceilf(( float)accMLO->transformer1.fouriers.getSize()*2/(float)BLOCK_SIZE));
 			AccUtilities::multiply<XFLOAT>(FMultiBsize, BLOCK_SIZE, accMLO->transformer1.fouriers.getStream(),
@@ -463,14 +464,12 @@ void normalizeAndTransformImage(	AccPtr<XFLOAT> &img_in,
 
 			AccPtr<ACCCOMPLEX> d_Fimg = img_in.make<ACCCOMPLEX>(xSize * ySize * zSize);
 			d_Fimg.allAlloc();
-			accMLO->transformer1.fouriers.streamSync();
 			windowFourierTransform2(
 					accMLO->transformer1.fouriers,
 					d_Fimg,
 					accMLO->transformer1.xFSize,accMLO->transformer1.yFSize, accMLO->transformer1.zFSize, //Input dimensions
 					xSize, ySize, zSize  //Output dimensions
 					);
-			accMLO->transformer1.fouriers.streamSync();
 
 			d_Fimg.cpToHost();
 			d_Fimg.streamSync();

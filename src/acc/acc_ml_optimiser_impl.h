@@ -833,12 +833,10 @@ void getFourierTransformsAndCtfs(long int part_id,
 #else
             	LAUNCH_PRIVATE_ERROR(cudaGetLastError(),accMLO->errorStatus);
 #endif
-                softMaskSum.streamSync();
-
-                // Finalize the background value
+                // getSumOnDevice synchronises the stream before it returns each sum, so no
+                // explicit sync is needed before or after (all of this is on one stream).
                 bg_val = (RFLOAT) AccUtilities::getSumOnDevice<XFLOAT>(softMaskSum_bg) /
                     (RFLOAT) AccUtilities::getSumOnDevice<XFLOAT>(softMaskSum);
-                softMaskSum.streamSync();
             }
 
             //avoid kernel-calls warning about null-pointer for RandomImage
@@ -855,12 +853,11 @@ void getFourierTransformsAndCtfs(long int part_id,
                 cosine_width,
                 bg_val);
 
+            // No sync: d_img is next read by normalizeAndTransformImage, on the same stream.
 #ifdef _HIP_ENABLED
             LAUNCH_PRIVATE_ERROR(hipGetLastError(),accMLO->errorStatus);
-            DEBUG_HANDLE_ERROR(hipStreamSynchronize(hipStreamPerThread));
 #else
             LAUNCH_PRIVATE_ERROR(cudaGetLastError(),accMLO->errorStatus);
-            DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
 #endif
 
             CTOC(accMLO->timer,"applyMask");
@@ -904,7 +901,6 @@ void getFourierTransformsAndCtfs(long int part_id,
 #endif
             spectrumAndXi2.allAlloc();
             spectrumAndXi2.accInit(0);
-            spectrumAndXi2.streamSync();
 
             int gridSize = CEIL((float)(accMLO->transformer1.fouriers.getSize()) / (float)POWERCLASS_BLOCK_SIZE);
             if(accMLO->dataIs3D)
@@ -946,7 +942,7 @@ void getFourierTransformsAndCtfs(long int part_id,
     LAUNCH_PRIVATE_ERROR(hipGetLastError(),accMLO->errorStatus);
 #endif
 
-			spectrumAndXi2.streamSync();
+			// The init, the kernel and the copy are all on this stream: wait once, before reading.
 			spectrumAndXi2.cpToHost();
 			spectrumAndXi2.streamSync();
 
