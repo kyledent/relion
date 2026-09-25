@@ -2003,7 +2003,8 @@ void BackProjector::reconstructGrad(
 		RFLOAT min_resol_shell,
 		bool use_fsc,
 		bool printTimes,
-		bool do_gpu)
+		bool do_gpu,
+		int nr_threads)
 {
 	const int max_r2 = ROUND(r_max * padding_factor) * ROUND(r_max * padding_factor);
 	RFLOAT oversampling_correction = (ref_dim == 3) ? (padding_factor * padding_factor * padding_factor) : (padding_factor * padding_factor);
@@ -2129,7 +2130,7 @@ void BackProjector::reconstructGrad(
 	// The latter may give memory problems as detected by electric fence....
 	Projector::decenter(PPref.data, Fconv, max_r2);
 //	RCTIC(ReconTimer,ReconS_17);
-	windowToOridimRealSpace(transformer, vol_out, printTimes);
+	windowToOridimRealSpace(transformer, vol_out, printTimes, nr_threads);
 //	RCTOC(ReconTimer,ReconS_17);
 
 #ifdef DEBUG_NGD
@@ -2523,7 +2524,39 @@ void BackProjector::convoluteBlobRealSpace(FourierTransformer &transformer, bool
     transformer.FourierTransform();
 }
 
-void BackProjector::windowToOridimRealSpace(FourierTransformer &transformer, MultidimArray<RFLOAT> &Mout, bool printTimes)
+// With nr_threads > 1, windowToOridimRealSpace's element-wise loops, as OpenMP loops over the slowest index.
+// Each gives the same values as the serial loop it replaces.
+static void centerFFTbySignThreaded(MultidimArray<Complex> &v, int nr_threads)
+{
+	#pragma omp parallel for num_threads(nr_threads)
+	FOR_ALL_ELEMENTS_IN_ARRAY3D(v)
+	{
+		if (((k ^ i ^ j) & 1) != 0) // if ODD
+			DIRECT_A3D_ELEM(v, k, i, j) *= -1;
+	}
+}
+
+// MultidimArray::window(z0, y0, x0, zF, yF, xF) with init_value 0
+static void window3DThreaded(MultidimArray<RFLOAT> &M, long int z0, long int y0, long int x0,
+		long int zF, long int yF, long int xF, int nr_threads)
+{
+	MultidimArray<RFLOAT> result;
+	result.resize(zF - z0 + 1, yF - y0 + 1, xF - x0 + 1);
+	STARTINGZ(result) = z0;
+	STARTINGY(result) = y0;
+	STARTINGX(result) = x0;
+	#pragma omp parallel for num_threads(nr_threads)
+	for (long int k = z0; k <= zF; k++)
+		for (long int i = y0; i <= yF; i++)
+			for (long int j = x0; j <= xF; j++)
+				A3D_ELEM(result, k, i, j) = ((k >= STARTINGZ(M) && k <= FINISHINGZ(M)) &&
+				                             (i >= STARTINGY(M) && i <= FINISHINGY(M)) &&
+				                             (j >= STARTINGX(M) && j <= FINISHINGX(M))) ? A3D_ELEM(M, k, i, j) : 0.;
+	M.moveFrom(result);
+}
+
+void BackProjector::windowToOridimRealSpace(FourierTransformer &transformer, MultidimArray<RFLOAT> &Mout, bool printTimes,
+		int nr_threads)
 {
 
 #ifdef TIMING
@@ -2595,7 +2628,10 @@ void BackProjector::windowToOridimRealSpace(FourierTransformer &transformer, Mul
 
 	// Shift the map back to its origin
 	RCTIC(OriDimTimer,OriDim6);
-	CenterFFTbySign(Fin);
+	if (nr_threads > 1)
+		centerFFTbySignThreaded(Fin, nr_threads);
+	else
+		CenterFFTbySign(Fin);
 	RCTOC(OriDimTimer,OriDim6);
 
 	// Do the inverse FFT
@@ -2626,6 +2662,11 @@ void BackProjector::windowToOridimRealSpace(FourierTransformer &transformer, Mul
 		Mout.window(FIRST_XMIPP_INDEX(ori_size), FIRST_XMIPP_INDEX(ori_size),
 				       LAST_XMIPP_INDEX(ori_size), LAST_XMIPP_INDEX(ori_size));
 	}
+	else if (nr_threads > 1)
+	{
+		window3DThreaded(Mout, FIRST_XMIPP_INDEX(ori_size), FIRST_XMIPP_INDEX(ori_size), FIRST_XMIPP_INDEX(ori_size),
+				LAST_XMIPP_INDEX(ori_size), LAST_XMIPP_INDEX(ori_size), LAST_XMIPP_INDEX(ori_size), nr_threads);
+	}
 	else
 	{
 		Mout.window(FIRST_XMIPP_INDEX(ori_size), FIRST_XMIPP_INDEX(ori_size), FIRST_XMIPP_INDEX(ori_size),
@@ -2636,7 +2677,14 @@ void BackProjector::windowToOridimRealSpace(FourierTransformer &transformer, Mul
 	// Normalisation factor of FFTW
 	// The Fourier Transforms are all "normalised" for 2D transforms of size = ori_size x ori_size
 	RCTIC(OriDimTimer,OriDim8);
-	Mout /= normfft;
+	if (nr_threads > 1)
+	{
+		#pragma omp parallel for num_threads(nr_threads)
+		for (long int n = 0; n < MULTIDIM_SIZE(Mout); n++)
+			DIRECT_MULTIDIM_ELEM(Mout, n) /= normfft;
+	}
+	else
+		Mout /= normfft;
 	RCTOC(OriDimTimer,OriDim8);
 #ifdef DEBUG_WINDOWORIDIMREALSPACE
 	tt()=Mout;
@@ -2645,7 +2693,7 @@ void BackProjector::windowToOridimRealSpace(FourierTransformer &transformer, Mul
 
 	// Mask out corners to prevent aliasing artefacts
 	RCTIC(OriDimTimer,OriDim9);
-	softMaskOutsideMap(Mout);
+	softMaskOutsideMap(Mout, -1., 3, NULL, nr_threads);
 	RCTOC(OriDimTimer,OriDim9);
 
 #ifdef DEBUG_WINDOWORIDIMREALSPACE

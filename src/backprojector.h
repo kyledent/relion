@@ -359,7 +359,8 @@ public:
 			RFLOAT min_resol_shell=0,
 			bool use_fsc=true,
 			bool printTimes=false,
-			bool do_gpu=false);  // the current reference's Fourier transform on the GPU (double cuFFT)
+			bool do_gpu=false,  // the current reference's Fourier transform on the GPU (double cuFFT)
+			int nr_threads=1);  // threads for windowToOridimRealSpace's real-space loops
 
 	/*	Enforce Hermitian symmetry, apply helical symmetry as well as point-group symmetry
 	 */
@@ -388,7 +389,9 @@ public:
 	/* Calculate the inverse FFT of Fin and windows the result to ori_size
 	 * Also pass the transformer, to prevent making and clearing a new one before clearing the one in reconstruct()
 	 */
-	void windowToOridimRealSpace(FourierTransformer &transformer, MultidimArray<RFLOAT> &Mout, bool printTimes = false);
+	// nr_threads > 1: the real-space loops after the inverse FFT spread over OpenMP threads (see the .cpp)
+	void windowToOridimRealSpace(FourierTransformer &transformer, MultidimArray<RFLOAT> &Mout, bool printTimes = false,
+			int nr_threads = 1);
 
 	/*
 	 * The same, but without the spherical cropping and thus invertible

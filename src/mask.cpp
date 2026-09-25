@@ -40,7 +40,8 @@ template class std::basic_string<char>;
 #endif
 // Mask out corners outside sphere (replace by average value)
 // Apply a soft mask (raised cosine with cosine_width pixels width)
-void softMaskOutsideMap(MultidimArray<RFLOAT> &vol, RFLOAT radius, RFLOAT cosine_width, MultidimArray<RFLOAT> *Mnoise)
+void softMaskOutsideMap(MultidimArray<RFLOAT> &vol, RFLOAT radius, RFLOAT cosine_width, MultidimArray<RFLOAT> *Mnoise,
+		int n_threads)
 {
 
 	vol.setXmippOrigin();
@@ -53,6 +54,7 @@ void softMaskOutsideMap(MultidimArray<RFLOAT> &vol, RFLOAT radius, RFLOAT cosine
 	if (Mnoise == NULL)
 	{
 		// Calculate average background value
+		#pragma omp parallel for num_threads(n_threads) private(r, raisedcos) reduction(+:sum, sum_bg) if(n_threads > 1)
 		FOR_ALL_ELEMENTS_IN_ARRAY3D(vol)
 		{
 			r = sqrt((RFLOAT)(k*k + i*i + j*j));
@@ -74,6 +76,7 @@ void softMaskOutsideMap(MultidimArray<RFLOAT> &vol, RFLOAT radius, RFLOAT cosine
 	}
 
 	// Apply noisy or average background value
+	#pragma omp parallel for num_threads(n_threads) private(r, raisedcos) if(n_threads > 1)
 	FOR_ALL_ELEMENTS_IN_ARRAY3D(vol)
 	{
 		r = sqrt((RFLOAT)(k*k + i*i + j*j));
