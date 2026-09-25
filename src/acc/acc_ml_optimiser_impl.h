@@ -21,7 +21,7 @@ static XFLOAT *coarseGemmMatrix(
 		size_t &ld)
 {
 	CoarseGemmCache &cache = accMLO->bundle->coarseGemm;
-	const size_t K = 3 * image_size + 1;
+	const size_t K = CoarseGemm::kdim(image_size);
 	ld = (K + 31) / 32 * 32;
 	std::lock_guard<std::mutex> lock(cache.mutex);
 	if (!cache.entries.empty() && cache.entries[0].iter != iter)
@@ -90,7 +90,7 @@ static bool coarseGemmScores(
 	XFLOAT *R = coarseGemmMatrix(accMLO, iclass, iter, projKernel, d_eulers, orientation_num, image_size, stream, ld);
 	if (R == NULL)
 		return false;
-	const size_t K = 3 * image_size + 1;
+	const size_t K = CoarseGemm::kdim(image_size);
 
 	AccPtr<XFLOAT> Q = ptrFactory.make<XFLOAT>(translation_num * ld);
 	Q.setStream(stream);
@@ -4477,7 +4477,7 @@ static void getAllSquaredDifferencesCoarseBatch(
 			else
 			{
 				const int nP = (int) g.size();
-				const size_t K = 3 * P + 1;
+				const size_t K = CoarseGemm::kdim(P);
 				keep.emplace_back(new AccPtr<XFLOAT>(ptrFactory.make<XFLOAT>((size_t) nP * T * ld)));
 				AccPtr<XFLOAT> &Q = *keep.back();
 				Q.setStream(stream);
