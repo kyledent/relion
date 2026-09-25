@@ -29,11 +29,13 @@
 
 // Mask out corners outside sphere (replace by average value)
 // Apply a soft mask (raised cosine with cosine_width pixels width)
+// n_threads > 1 spreads both passes over OpenMP threads (the background sum then adds in another order).
 void softMaskOutsideMap(
 		MultidimArray<RFLOAT> &vol,
 		RFLOAT radius = -1.,
 		RFLOAT cosine_width = 3,
-		MultidimArray<RFLOAT> *Mnoise = NULL);
+		MultidimArray<RFLOAT> *Mnoise = NULL,
+		int n_threads = 1);
 
 // May27,2015 - Shaoda, Helical refinement
 void softMaskOutsideMapForHelix(

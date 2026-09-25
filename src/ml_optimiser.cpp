@@ -5087,6 +5087,8 @@ void MlOptimiser::maximization()
                     if(do_grad) {
                         // RELION_GRAD_GPU_FTMAP=1: the reference's Fourier transform on the GPU, as in the expectation
                         static const bool gpu_ftmap = getenv("RELION_GRAD_GPU_FTMAP") != NULL && atoi(getenv("RELION_GRAD_GPU_FTMAP")) > 0;
+                        // RELION_GRAD_THREADS=1: the real-space loops after the inverse FFT on the run's threads
+                        static const bool grad_threads = getenv("RELION_GRAD_THREADS") != NULL && atoi(getenv("RELION_GRAD_THREADS")) > 0;
                         (wsum_model.BPref[iclass]).reconstructGrad(
                                 mymodel.Iref[iclass],
                                 mymodel.fsc_halves_class[iclass],
@@ -5095,7 +5097,8 @@ void MlOptimiser::maximization()
                                 mymodel.getPixelFromResolution(1./grad_min_resol),
                                 do_split_random_halves,
                                 (iclass == 0),
-                                do_gpu && gpu_ftmap);
+                                do_gpu && gpu_ftmap,
+                                grad_threads ? nr_threads : 1);
                     }
                     else
                         (wsum_model.BPref[iclass]).reconstruct(mymodel.Iref[iclass],
