@@ -219,7 +219,7 @@ if (in.getAllocator() == NULL)
 	DEBUG_HANDLE_ERROR(cub::DeviceRadixSort::SortKeys( alloc->getPtr(), temp_storage_size, ~in, ~out, in.getSize(), 0, sizeof(T) * 8, stream));
 
 	alloc->markReadyEvent(stream);
-	alloc->doFreeWhenReady();
+	in.getAllocator()->freeWhenReady(alloc);
 }
 
 template <typename T>
@@ -247,7 +247,7 @@ if (in.getAllocator() == NULL)
 	DEBUG_HANDLE_ERROR(cub::DeviceRadixSort::SortKeysDescending( alloc->getPtr(), temp_storage_size, ~in, ~out, in.getSize(), 0, sizeof(T) * 8, stream));
 
 	alloc->markReadyEvent(stream);
-	alloc->doFreeWhenReady();
+	in.getAllocator()->freeWhenReady(alloc);
 
 }
 
@@ -352,7 +352,7 @@ if (in.getAllocator() == NULL)
 	DEBUG_HANDLE_ERROR(cub::DeviceScan::InclusiveSum( alloc->getPtr(), temp_storage_size, ~in, ~out, in.getSize(), stream));
 
 	alloc->markReadyEvent(stream);
-	alloc->doFreeWhenReady();
+	in.getAllocator()->freeWhenReady(alloc);
 }
 
 } // namespace CudaKernels

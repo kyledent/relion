@@ -18,6 +18,11 @@
 #include "src/macros.h"
 #include "src/error.h"
 #include "src/parallel.h"
+#include <algorithm>
+#ifdef TIMING
+#include <atomic>
+#include <chrono>
+#endif
 
 #ifdef CUSTOM_ALLOCATOR_MEMGUARD
 #include "src/acc/cuda/shortcuts.cuh"
@@ -116,6 +121,42 @@ private:
 
 	omp_lock_t mutex;
 
+	// Blocks handed back through freeWhenReady(), awaiting their ready event. alloc() used to find
+	// them by walking the whole allocation list under the lock on every call; now it scans these.
+	std::vector<Alloc*> pending;
+
+#ifdef TIMING
+	// Contention counters, TIMING builds only: every thread of the process takes this lock, and
+	// alloc() walks the whole allocation list (querying the ready event of every pending deferred
+	// free) while holding it. Printed per allocator when it is destroyed.
+	std::atomic<long long> stat_wait_ns{0}, stat_hold_ns{0}, stat_locks{0},
+	                       stat_event_queries{0}, stat_list_steps{0};
+
+	class TimedLock
+	{
+		CudaCustomAllocator &a;
+		std::chrono::steady_clock::time_point acquired;
+	public:
+		explicit TimedLock(CudaCustomAllocator &allocator) : a(allocator)
+		{
+			std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+			omp_set_lock(&a.mutex);
+			acquired = std::chrono::steady_clock::now();
+			a.stat_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(acquired - t0).count();
+			a.stat_locks++;
+		}
+		~TimedLock()
+		{
+			a.stat_hold_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - acquired).count();
+			omp_unset_lock(&a.mutex);
+		}
+	};
+#define CCA_LOCK TimedLock ml(*this)
+#else
+#define CCA_LOCK Lock ml(&mutex)
+#endif
+
 
 	//Look for the first suited space
 	Alloc *_getFirstSuitedFree(size_t size)
@@ -148,8 +189,43 @@ private:
 		return somethingReady;
 	}
 
-	//Free allocs with recorded ready events
+	//Free the pending blocks (handed back through freeWhenReady) whose ready event has completed.
+	//Every alloc() calls this under the lock, so it looks only at the pending list. Freeing a set of
+	//blocks leaves the same free regions in any order, so this frees exactly what the whole-list
+	//sweep below would, only faster.
 	bool _freeReadyAllocs()
+	{
+		bool somethingFreed(false);
+		for (size_t i = 0; i < pending.size(); )
+		{
+			Alloc *a = pending[i];
+#ifdef TIMING
+			stat_list_steps++;
+			stat_event_queries++;
+#endif
+			cudaError_t e = cudaEventQuery(a->readyEvent);
+			if (e == cudaSuccess)
+			{
+				pending[i] = pending.back();
+				pending.pop_back();
+				_free(a);
+				somethingFreed = true;
+			}
+			else if (e == cudaErrorNotReady)
+				i++;
+			else
+			{
+				_printState();
+				HandleError( e, __FILE__, __LINE__ );
+			}
+		}
+		return somethingFreed;
+	}
+
+	//Free allocs with recorded ready events, walking the whole allocation list. Kept for the
+	//out-of-memory path and freeReadyAllocs(): it also frees a block marked ready through
+	//Alloc::doFreeWhenReady() directly, which never entered the pending list.
+	bool _freeReadyAllocsFullScan()
 	{
 		bool somethingFreed(false);
 		Alloc *next = first;
@@ -159,13 +235,25 @@ private:
 		{
 			curr = next;
 			next = curr->next;
+#ifdef TIMING
+			stat_list_steps++;
+#endif
 
 			if (! curr->free && curr->freeWhenReady && curr->readyEvent != 0)
 			{
+#ifdef TIMING
+				stat_event_queries++;
+#endif
 				cudaError_t e = cudaEventQuery(curr->readyEvent);
 
 				if (e == cudaSuccess)
 				{
+					std::vector<Alloc*>::iterator it = std::find(pending.begin(), pending.end(), curr);
+					if (it != pending.end())
+					{
+						*it = pending.back();
+						pending.pop_back();
+					}
 					_free(curr);
 					next = first; //List modified, restart
 					somethingFreed = true;
@@ -450,6 +538,7 @@ private:
 
 	void _clear()
 	{
+		pending.clear();
 		if (first->ptr != NULL)
 			DEBUG_HANDLE_ERROR(cudaFree( first->ptr ));
 
@@ -477,7 +566,7 @@ public:
 
 	void resize(size_t size)
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		_clear();
 		totalSize = size;
 		_setup();
@@ -486,7 +575,7 @@ public:
 
 	Alloc* alloc(size_t requestedSize)
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 
 		_freeReadyAllocs();
 
@@ -521,7 +610,7 @@ public:
 				//Try to recover before throwing error
 				for (int i = 0; i <= ALLOC_RETRY; i ++)
 				{
-					if (_syncReadyEvents() && _freeReadyAllocs())
+					if (_syncReadyEvents() && (_freeReadyAllocs() | _freeReadyAllocsFullScan()))
 					{
 						curAlloc = _getFirstSuitedFree(size); //Is there space now?
 						if (curAlloc != NULL)
@@ -603,9 +692,15 @@ public:
 	~CudaCustomAllocator()
 	{
 		{
-			Lock ml(&mutex);
+			CCA_LOCK;
 			_clear();
 		}
+#ifdef TIMING
+		printf("allocator-stats pid %d: %lld locks, waited %.3f s, held %.3f s, %lld list steps, "
+		       "%lld event queries\n", (int)getpid(), (long long)stat_locks, 1e-9 * stat_wait_ns,
+		       1e-9 * stat_hold_ns, (long long)stat_list_steps, (long long)stat_event_queries);
+		fflush(stdout);
+#endif
 		omp_destroy_lock(&mutex);
 	}
 
@@ -613,56 +708,66 @@ public:
 
 	void free(Alloc* a)
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		_free(a);
 	}
 
 	void syncReadyEvents()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		_syncReadyEvents();
 	}
 
 	void freeReadyAllocs()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		_freeReadyAllocs();
+		_freeReadyAllocsFullScan();
+	}
+
+	// Hand a block back, to be freed once its ready event (recorded by the caller) has completed.
+	void freeWhenReady(Alloc* a)
+	{
+		CCA_LOCK;
+		a->freeWhenReady = true;
+		pending.push_back(a);
 	}
 
 	size_t getTotalFreeSpace()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		size_t size = _getTotalFreeSpace();
 		return size;
 	}
 
 	size_t getTotalUsedSpace()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		size_t size = _getTotalUsedSpace();
 		return size;
 	}
 
 	size_t getNumberOfAllocs()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		size_t size = _getNumberOfAllocs();
 		return size;
 	}
 
 	size_t getLargestContinuousFreeSpace()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		size_t size = _getLargestContinuousFreeSpace();
 		return size;
 	}
 
 	void printState()
 	{
-		Lock ml(&mutex);
+		CCA_LOCK;
 		_printState();
 	}
 };
 //
 
+#undef CCA_LOCK
 #endif

@@ -1306,7 +1306,7 @@ public:
 
 			if (alloc->getReadyEvent() == 0)
 				alloc->markReadyEvent(stream);
-			alloc->doFreeWhenReady();
+			allocator->freeWhenReady(alloc);
 			alloc = NULL;
 
 //			DEBUG_HANDLE_ERROR(cudaFree(dPtr));
