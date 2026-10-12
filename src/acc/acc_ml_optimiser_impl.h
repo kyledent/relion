@@ -1625,19 +1625,21 @@ void getAllSquaredDifferencesCoarse(
 						{
 							dG.cpToHost(); dK.cpToHost(); dK.streamSync();
 							double maxDiff = 0., maxK = 0., maxRel = 0.;
-							size_t nonFinite = 0;
+							size_t nonFinite = 0, iG = 0, iK = 0;
 							for (size_t i = 0; i < n; i++)
 							{
 								if (!std::isfinite((double) dG[i])) { nonFinite++; continue; }
+								if (dG[i] < dG[iG]) iG = i;
+								if (dK[i] < dK[iK]) iK = i;
 								const double d = fabs((double) dG[i] - (double) dK[i]), k = fabs((double) dK[i]);
 								maxDiff = std::max(maxDiff, d);
 								maxK = std::max(maxK, k);
 								if (k > 0.) maxRel = std::max(maxRel, d / k);
 							}
 							printf("coarse-gemm-check iter %d class %d: %zu orientations x %lu translations, %lu pixels: "
-							       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e, non-finite %zu\n",
+							       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e, non-finite %zu, best moved %d, kernel gap %.3e\n",
 							       baseMLO->iter, (int) iclass, (size_t) plan.orientation_num, translation_num,
-							       image_size, maxDiff, maxK, maxRel, nonFinite);
+							       image_size, maxDiff, maxK, maxRel, nonFinite, (int) (iG != iK), (double) dK[iG] - (double) dK[iK]);
 							fflush(stdout);
 						}
 					}
@@ -4742,18 +4744,20 @@ static void getAllSquaredDifferencesCoarseBatch(
 							(XFLOAT) pp->op->local_sqrtXi2[0], O, T, P, stream, false, false);
 					dG.cpToHost(); dK.cpToHost(); dK.streamSync();
 					double maxDiff = 0., maxK = 0., maxRel = 0.;
-					size_t nonFinite = 0;
+					size_t nonFinite = 0, iG = 0, iK = 0;
 					for (size_t i = 0; i < n; i++)
 					{
 						if (!std::isfinite((double) dG[i])) { nonFinite++; continue; }
+						if (dG[i] < dG[iG]) iG = i;
+						if (dK[i] < dK[iK]) iK = i;
 						const double d = fabs((double) dG[i] - (double) dK[i]), k = fabs((double) dK[i]);
 						maxDiff = std::max(maxDiff, d);
 						maxK = std::max(maxK, k);
 						if (k > 0.) maxRel = std::max(maxRel, d / k);
 					}
 					printf("coarse-gemm-check iter %d class %d: %zu orientations x %zu translations, %zu pixels: "
-					       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e, non-finite %zu (batch of %d)\n",
-					       baseMLO->iter, c, O, T, P, maxDiff, maxK, maxRel, nonFinite, nP);
+					       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e, non-finite %zu, best moved %d, kernel gap %.3e (batch of %d)\n",
+					       baseMLO->iter, c, O, T, P, maxDiff, maxK, maxRel, nonFinite, (int) (iG != iK), (double) dK[iG] - (double) dK[iK], nP);
 					fflush(stdout);
 				}
 			}
