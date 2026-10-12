@@ -43,6 +43,7 @@
 #include "src/macros.h"
 #include "src/error.h"
 #include "src/ml_optimiser.h"
+#include "src/perf_defaults.h"
 #ifdef _CUDA_ENABLED
     #include "src/acc/cuda/cuda_ml_optimiser.h"
     #ifdef CUDA_PROFILING
@@ -1785,6 +1786,8 @@ void MlOptimiser::initialise()
 
     grad_pseudo_halfsets = gradient_refine && !do_split_random_halves;
 
+    applyPerfDefaults();
+
 #if defined(MKLFFT) || defined(FFTW_THREADS)
     // Enable multi-threaded FFTW
     int success = fftw_init_threads();
@@ -1902,6 +1905,13 @@ void MlOptimiser::checkMask(FileName &_fn_mask, int solvent_nr, int rank)
     }
 
     return;
+}
+
+void MlOptimiser::applyPerfDefaults()
+{
+    PerfRunType type = gradient_refine ? PERF_GRADIENT : do_auto_refine ? PERF_REFINE3D :
+                       (fn_ref == "None" && !is_3d_model) ? PERF_CLASS2D : PERF_CLASS3D;
+    applyPerformanceDefaults(type, do_gpu, verb > 0);
 }
 
 void MlOptimiser::initialiseGeneral(int rank)

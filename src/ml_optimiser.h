@@ -971,6 +971,9 @@ public:
 	// Some general stuff that is shared between MPI and sequential code in the early stages of initialisation
 	void initialiseGeneral(int rank = 0);
 
+	// Set the performance switches' defaults for this run type and GPU (src/perf_defaults.h)
+	void applyPerfDefaults();
+
 	// Randomise particle processing order and resize metadata array
 	void initialiseWorkLoad();
 

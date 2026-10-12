@@ -730,6 +730,8 @@ will still yield good performance and possibly a more stable execution. \n" << s
 		fn_ref.getHalf(fn_ref, my_halfset);
 	}
 
+	applyPerfDefaults();
+
 #if defined(MKLFFT) || defined(FFTW_THREADS)
 	// Enable multi-threaded FFTW
 	int success = fftw_init_threads();
