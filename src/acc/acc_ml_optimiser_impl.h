@@ -1,43 +1,9 @@
 static omp_lock_t global_mutex;
 
-#include "src/acc/acc_operand_dump.h"
 #include <climits>
-#include <atomic>
-#include <unistd.h>
 
-// RELION_SIG_COMPACT (convertAllSquaredDifferencesToWeights, CUDA): 1 copies back only the indices of the coarse
-// pass's significant samples; 2 does that and the full copy, compares them, and prints the totals at exit.
-// RELION_PDF_CACHE=2 (convertAllSquaredDifferencesToWeights): the rebuilt orientation prior against the cached one.
-struct PdfCacheCheckTotals
-{
-	std::atomic<long long> checked{0}, differ{0};
-	void record(bool same) { checked++; if (!same) differ++; }
-	~PdfCacheCheckTotals()
-	{
-		if (checked > 0)
-			printf("pdf-cache-check pid %d: %lld priors compared with the cache, %lld differ\n", (int)getpid(),
-			       (long long)checked, (long long)differ);
-		fflush(stdout);
-	}
-};
-inline PdfCacheCheckTotals &pdfCacheCheck()
-{
-	static PdfCacheCheckTotals t;
-	return t;
-}
-
-struct SigCompactTotals
-{
-	std::atomic<long long> checked{0}, mismatched{0}, entries{0}, significant{0};
-	~SigCompactTotals()
-	{
-		if (checked > 0)
-			printf("sig-compact-check pid %d: %lld particles checked, %lld entries, %lld significant, %lld particles differ\n",
-			       (int)getpid(), (long long)checked, (long long)entries, (long long)significant, (long long)mismatched);
-		fflush(stdout);
-	}
-};
-static SigCompactTotals sig_compact_totals;
+// RELION_SIG_COMPACT=1 (convertAllSquaredDifferencesToWeights, CUDA): copy back only the indices of the coarse
+// pass's significant samples.
 
 #if defined(_CUDA_ENABLED) && defined(__CUDACC__)
 #include "src/acc/cuda/cuda_coarse_gemm.cuh"
@@ -198,56 +164,6 @@ static bool coarseGemmScores(
 }
 #endif
 
-#ifdef CC_WEIGHTS_SELFCHECK
-// Self-check of the CC coarse significance, built only with -DCC_WEIGHTS_SELFCHECK: repeat the
-// original host copy of the weights and its threshold loop over the scored entries, and count any
-// entry whose significance differs from what was set. Each process prints its totals at exit.
-#include <atomic>
-#include <unistd.h>
-struct CcWeightsSelfcheckTotals
-{
-	std::atomic<long long> calls{0}, entries{0}, mismatches{0};
-	~CcWeightsSelfcheckTotals()
-	{
-		if (calls > 0)
-			printf("cc-weights-selfcheck pid %d: %lld particles, %lld entries, %lld differ from the original loop\n",
-			       (int)getpid(), (long long)calls, (long long)entries, (long long)mismatches);
-		fflush(stdout);
-	}
-};
-static CcWeightsSelfcheckTotals cc_weights_selfcheck_totals;
-
-static void cc_weights_selfcheck(AccPtr<XFLOAT> &weights, MultidimArray<bool> &significant, XFLOAT threshold)
-{
-	weights.cpToHost();
-	weights.streamSync();
-	long long bad = 0;
-	for (size_t i = 0; i < weights.getSize(); i++)
-		if ((weights[i] >= threshold) != DIRECT_A1D_ELEM(significant, i))
-			bad++;
-	cc_weights_selfcheck_totals.calls++;
-	cc_weights_selfcheck_totals.entries += (long long)weights.getSize();
-	cc_weights_selfcheck_totals.mismatches += bad;
-}
-#endif
-
-// Sub-steps of getFourierTransformsAndCtfs, timed under TIMING for the first particle of each batch,
-// like the phases around them. A step's stop first synchronises this thread's stream, so GPU work is
-// counted in the step that queued it rather than in whichever later step happens to wait for it.
-#ifdef TIMING
-#if defined(_CUDA_ENABLED)
-#define FT_STEP_SYNC() DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread))
-#elif defined(_HIP_ENABLED)
-#define FT_STEP_SYNC() DEBUG_HANDLE_ERROR(hipStreamSynchronize(hipStreamPerThread))
-#else
-#define FT_STEP_SYNC()
-#endif
-#define FT_STEP_TIC(tag) do { if (ftTimed) baseMLO->timer.tic(baseMLO->tag); } while (0)
-#define FT_STEP_TOC(tag) do { if (ftTimed) { FT_STEP_SYNC(); baseMLO->timer.toc(baseMLO->tag); } } while (0)
-#else
-#define FT_STEP_TIC(tag) do { } while (0)
-#define FT_STEP_TOC(tag) do { } while (0)
-#endif
 
 #ifdef _SYCL_ENABLED
 #include "src/acc/sycl/sycl_virtual_dev.h"
@@ -269,11 +185,9 @@ void getFourierTransformsAndCtfs(long int part_id,
 {
 		GTIC(accMLO->timer,"getFourierTransformsAndCtfs");
 #ifdef TIMING
-	const bool ftTimed = part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id];
-	if (ftTimed)
+	if (part_id == baseMLO->exp_my_first_part_id)
 		baseMLO->timer.tic(baseMLO->TIMING_ESP_FT);
 #endif
-	FT_STEP_TIC(TIMING_FT_PRIORS);
 
 	CUSTOM_ALLOCATOR_REGION_NAME("GFTCTF");
     Matrix2D<RFLOAT> Aori;
@@ -490,8 +404,6 @@ void getFourierTransformsAndCtfs(long int part_id,
     int optics_group = baseMLO->mydata.getOpticsGroup(part_id);
     bool ctf_premultiplied = baseMLO->mydata.obsModel.getCtfPremultiplied(optics_group);
 
-    FT_STEP_TOC(TIMING_FT_PRIORS);
-    FT_STEP_TIC(TIMING_FT_READ);
     FileName fn_img;
     Image<RFLOAT> img, rec_img;
     if (!baseMLO->mydata.getImageNameOnScratch(part_id, fn_img))
@@ -579,12 +491,10 @@ void getFourierTransformsAndCtfs(long int part_id,
 
     MultidimArray<RFLOAT> wholestack;
     if (op.is_tomo) wholestack=img();
-    FT_STEP_TOC(TIMING_FT_READ);
 
     for (int img_id = 0; img_id < sp.nr_images; img_id++)
 	{
 		CTIC(accMLO->timer,"init");
-		FT_STEP_TIC(TIMING_FT_UPLOAD);
 		MultidimArray<Complex > Fimg;
 		MultidimArray<Complex > Faux;
 		MultidimArray<RFLOAT> Fctf, FstMulti;
@@ -740,8 +650,6 @@ void getFourierTransformsAndCtfs(long int part_id,
             }
         }
 
-        FT_STEP_TOC(TIMING_FT_UPLOAD);
-        FT_STEP_TIC(TIMING_FT_FFT_NOMASK);
         if(baseMLO->has_converged && baseMLO->do_use_reconstruct_images)
         {
 
@@ -797,7 +705,6 @@ void getFourierTransformsAndCtfs(long int part_id,
         CTOC(accMLO->timer,"selfApplyBeamTilt");
 
         op.Fimg_nomask.at(img_id) = Fimg;
-        FT_STEP_TOC(TIMING_FT_FFT_NOMASK);
 
         // ------------------------------------------------------------------------------------------
 
@@ -814,7 +721,6 @@ void getFourierTransformsAndCtfs(long int part_id,
         // We are now done with the unmasked image used for reconstruction.
         // Now make the masked image used for alignment and classification.
 
-        FT_STEP_TIC(TIMING_FT_MASK);
         if (is_helical_segment)
         {
             CTIC(accMLO->timer,"applyHelicalMask");
@@ -939,8 +845,6 @@ void getFourierTransformsAndCtfs(long int part_id,
 
         // ------------------------------------------------------------------------------------------
 
-        FT_STEP_TOC(TIMING_FT_MASK);
-        FT_STEP_TIC(TIMING_FT_FFT_MASK);
 #ifdef _HIP_ENABLED
         CTIC(hipMLO->timer,"normalizeAndTransform");
 #else
@@ -962,8 +866,6 @@ void getFourierTransformsAndCtfs(long int part_id,
 
         // ------------------------------------------------------------------------------------------
 
-        FT_STEP_TOC(TIMING_FT_FFT_MASK);
-        FT_STEP_TIC(TIMING_FT_POWER);
         CTIC(accMLO->timer,"powerClass");
         // Store the power_class spectrum of the whole image (to fill sigma2_noise between current_size and full_size
         if (baseMLO->image_current_size[optics_group] < baseMLO->image_full_size[optics_group])
@@ -1033,8 +935,6 @@ void getFourierTransformsAndCtfs(long int part_id,
 		}
 		CTOC(accMLO->timer,"powerClass");
 
-		FT_STEP_TOC(TIMING_FT_POWER);
-		FT_STEP_TIC(TIMING_FT_CTF);
 		Fctf.resize(Fimg);
 		// Now calculate the actual CTF
 		if (baseMLO->do_ctf_correction)
@@ -1119,8 +1019,6 @@ void getFourierTransformsAndCtfs(long int part_id,
 			Fctf.initConstant(1.);
 		}
 		CTOC(accMLO->timer,"ctfCorr");
-		FT_STEP_TOC(TIMING_FT_CTF);
-		FT_STEP_TIC(TIMING_FT_STORE);
 
 		CTIC(accMLO->timer,"selfApplyBeamTilt");
 		baseMLO->mydata.obsModel.demodulatePhase(optics_group, Fimg);
@@ -1266,11 +1164,10 @@ void getFourierTransformsAndCtfs(long int part_id,
 		} // end if mymodel.nr_bodies > 1
 
 
-		FT_STEP_TOC(TIMING_FT_STORE);
 	} // end loop img_id
 	//accMLO->transformer.clear();
 #ifdef TIMING
-	if (part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+	if (part_id == baseMLO->exp_my_first_part_id)
 		baseMLO->timer.toc(baseMLO->TIMING_ESP_FT);
 #endif
 	GTOC(accMLO->timer,"getFourierTransformsAndCtfs");
@@ -1293,7 +1190,7 @@ void getAllSquaredDifferencesCoarse(
 {
 
 #ifdef TIMING
-	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+	if (op.part_id == baseMLO->exp_my_first_part_id)
 		baseMLO->timer.tic(baseMLO->TIMING_ESP_DIFF1);
 #endif
 
@@ -1455,9 +1352,6 @@ void getAllSquaredDifferencesCoarse(
 	trans_xyz.allAlloc();
 	corr_img.allAlloc();
 
-	// Opt-in operand dump of this pass (acc_operand_dump.h); inert unless RELION_OPERAND_DUMP is set.
-	const bool dumpOperands = OperandDump::dir() != nullptr && OperandDump::claimParticle(baseMLO->iter);
-
     for (unsigned long img_id = 0; img_id < sp.nr_images; img_id++)
 	{
 
@@ -1605,54 +1499,11 @@ void getAllSquaredDifferencesCoarse(
 				{
 					AccProjectorPlan &plan = projectorPlans[iclass*sp.nr_images + img_id];
 					cudaStream_t stream = accMLO->classStreams[iclass];
-					if (CoarseGemm::checkCount() > 0 && CoarseGemm::totals.seen++ % CoarseGemm::checkCount() == 0)
-					{
-						CoarseGemm::totals.checked++;
-						// Check: both into zeroed buffers, compare, and keep the kernel's scores below.
-						const size_t n = plan.orientation_num * translation_num;
-						AccPtr<XFLOAT> dG = ptrFactory.make<XFLOAT>(n), dK = ptrFactory.make<XFLOAT>(n);
-						dG.setStream(stream); dK.setStream(stream);
-						dG.allAlloc(); dK.allAlloc();
-						deviceInitValue<XFLOAT>(dG, 0); deviceInitValue<XFLOAT>(dK, 0);
-						runDiff2KernelCoarse(projKernel, &(~trans_xyz)[trans_x_offset], &(~trans_xyz)[trans_y_offset],
-								&(~trans_xyz)[trans_z_offset], ~corr_img, &(~Fimg_)[img_re_offset], &(~Fimg_)[img_im_offset],
-								~plan.eulers, ~dK, (XFLOAT) op.local_sqrtXi2[img_id], plan.orientation_num,
-								translation_num, image_size, stream, do_CC, accMLO->dataIs3D);
-						if (coarseGemmScores(accMLO, ptrFactory, (int) iclass, baseMLO->iter, projKernel, ~plan.eulers,
-								plan.orientation_num, &(~trans_xyz)[trans_x_offset], &(~trans_xyz)[trans_y_offset],
-								~corr_img, &(~Fimg_)[img_re_offset], &(~Fimg_)[img_im_offset], translation_num,
-								image_size, ~dG, stream))
-						{
-							dG.cpToHost(); dK.cpToHost(); dK.streamSync();
-							double maxDiff = 0., maxK = 0., maxRel = 0.;
-							size_t nonFinite = 0, iG = 0, iK = 0;
-							for (size_t i = 0; i < n; i++)
-							{
-								if (!std::isfinite((double) dG[i])) { nonFinite++; continue; }
-								if (dG[i] < dG[iG]) iG = i;
-								if (dK[i] < dK[iK]) iK = i;
-								const double d = fabs((double) dG[i] - (double) dK[i]), k = fabs((double) dK[i]);
-								maxDiff = std::max(maxDiff, d);
-								maxK = std::max(maxK, k);
-								if (k > 0.) maxRel = std::max(maxRel, d / k);
-							}
-							printf("coarse-gemm-check iter %d class %d: %zu orientations x %lu translations, %lu pixels: "
-							       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e, non-finite %zu, best moved %d, kernel gap %.3e\n",
-							       baseMLO->iter, (int) iclass, (size_t) plan.orientation_num, translation_num,
-							       image_size, maxDiff, maxK, maxRel, nonFinite, (int) (iG != iK), (double) dK[iG] - (double) dK[iK]);
-							fflush(stdout);
-						}
-					}
-					else
-					{
-						gemmDone = coarseGemmScores(accMLO, ptrFactory, (int) iclass, baseMLO->iter, projKernel,
-								~plan.eulers, plan.orientation_num, &(~trans_xyz)[trans_x_offset],
-								&(~trans_xyz)[trans_y_offset], ~corr_img, &(~Fimg_)[img_re_offset],
-								&(~Fimg_)[img_im_offset], translation_num, image_size,
-								&(~allWeights)[allWeights_pos], stream);
-					}
-					if (gemmDone) CoarseGemm::totals.gemm++;
-					else CoarseGemm::totals.kernel++;
+					gemmDone = coarseGemmScores(accMLO, ptrFactory, (int) iclass, baseMLO->iter, projKernel,
+							~plan.eulers, plan.orientation_num, &(~trans_xyz)[trans_x_offset],
+							&(~trans_xyz)[trans_y_offset], ~corr_img, &(~Fimg_)[img_re_offset],
+							&(~Fimg_)[img_im_offset], translation_num, image_size,
+							&(~allWeights)[allWeights_pos], stream);
 				}
 #endif
 				if (!gemmDone)
@@ -1729,90 +1580,6 @@ void getAllSquaredDifferencesCoarse(
 	 #endif
 	#endif
 
-#ifdef _CUDA_ENABLED
-		if (dumpOperands)
-		{
-			// Everything the coarse kernel read for this image, and the diff2 it returned (as
-			// accumulated in allWeights, which also carries highres_Xi2/2 unless do_CC).
-			std::ostringstream name;
-			name << "coarse_it" << baseMLO->iter << "_part" << op.part_id << "_img" << img_id;
-			OperandDump::Writer w(name.str());
-			w.value("iter", baseMLO->iter).value("part_id", op.part_id).value("img_id", img_id)
-			 .value("nr_images", sp.nr_images).value("ipass", exp_ipass)
-			 .value("current_oversampling", sp.current_oversampling)
-			 .value("image_size", image_size).value("xdim", op.local_Minvsigma2.xdim)
-			 .value("ydim", op.local_Minvsigma2.ydim).value("zdim", op.local_Minvsigma2.zdim)
-			 .value("translation_num", translation_num).value("do_CC", do_CC)
-			 .value("is_tomo", op.is_tomo).value("data_is_3D", accMLO->dataIs3D)
-			 .value("shifts_is_3D", accMLO->shiftsIs3D)
-			 .value("do_ctf_correction", baseMLO->do_ctf_correction)
-			 .value("refs_are_ctf_corrected", baseMLO->refs_are_ctf_corrected)
-			 .value("ctf_premultiplied", baseMLO->mydata.obsModel.getCtfPremultiplied(optics_group))
-			 .value("do_scale_correction", baseMLO->do_scale_correction)
-			 .value("scale_correction", baseMLO->mymodel.scale_correction[group_id])
-			 .value("highres_Xi2", op.highres_Xi2_img[img_id])
-			 .value("sqrtXi2", op.local_sqrtXi2[img_id])
-			 .value("pixel_size", my_pixel_size)
-			 .value("image_full_size", baseMLO->image_full_size[optics_group])
-			 .value("iclass_min", sp.iclass_min).value("iclass_max", sp.iclass_max)
-			 .value("xfloat_bytes", sizeof(XFLOAT));
-			w.array("Fimg_kernel", &Fimg_[0], (size_t)image_size * 2)      // re block, then im block
-			 .array("corr_img", &corr_img[0], (size_t)image_size)           // the kernel uses corr/2
-			 .array("trans_xyz", &trans_xyz[0], (size_t)translation_num * 3) // x block, y, z
-			 .array("Fimg_raw", reinterpret_cast<const RFLOAT *>(Fimg.data), (size_t)image_size * 2)
-			 .array("Fctf", op.local_Fctf[img_id].data, (size_t)image_size)
-			 .array("Minvsigma2", op.local_Minvsigma2.data, (size_t)image_size);
-
-			std::vector<XFLOAT> hostWeights(allWeights.getSize());
-			DEBUG_HANDLE_ERROR(cudaMemcpy(hostWeights.data(), ~allWeights,
-					hostWeights.size() * sizeof(XFLOAT), cudaMemcpyDeviceToHost));
-			for (unsigned long iclass = sp.iclass_min, pos = 0; iclass <= sp.iclass_max; iclass++)
-			{
-				AccProjectorPlan &plan = projectorPlans[iclass*sp.nr_images + img_id];
-				if (plan.orientation_num <= 0)
-					continue;
-				int iproj = (baseMLO->mymodel.nr_bodies > 1) ? ibody : iclass;
-				AccProjectorKernel k = AccProjectorKernel::makeKernel(accMLO->bundle->projectors[iproj],
-						op.local_Minvsigma2.xdim, op.local_Minvsigma2.ydim,
-						op.local_Minvsigma2.zdim, op.local_Minvsigma2.xdim-1);
-				std::vector<XFLOAT> eulers(plan.orientation_num * 9);
-				DEBUG_HANDLE_ERROR(cudaMemcpy(eulers.data(), ~plan.eulers,
-						eulers.size() * sizeof(XFLOAT), cudaMemcpyDeviceToHost));
-				std::string c = "_c" + std::to_string(iclass);
-				w.value(("orientation_num" + c).c_str(), plan.orientation_num)
-				 .value(("proj_mdlX" + c).c_str(), k.mdlX)
-				 .value(("proj_mdlY" + c).c_str(), k.mdlXY / k.mdlX)
-				 .value(("proj_mdlZ" + c).c_str(), k.mdlZ)
-				 .value(("proj_mdlInitY" + c).c_str(), k.mdlInitY)
-				 .value(("proj_mdlInitZ" + c).c_str(), k.mdlInitZ)
-				 .value(("proj_maxR" + c).c_str(), k.maxR)
-				 .value(("proj_maxR2_padded" + c).c_str(), k.maxR2_padded)
-				 .value(("proj_padding_factor" + c).c_str(), k.padding_factor)
-				 .value(("proj_imgX" + c).c_str(), k.imgX)
-				 .value(("proj_imgY" + c).c_str(), k.imgY)
-				 .value(("proj_imgZ" + c).c_str(), k.imgZ);
-				w.array(("eulers" + c).c_str(), eulers.data(), eulers.size())
-				 .array(("diff2" + c).c_str(), hostWeights.data() + pos,
-						(size_t)plan.orientation_num * translation_num);
-				pos += (size_t)plan.orientation_num * translation_num;
-
-				if (OperandDump::claimModel(baseMLO->iter, iproj))
-				{
-					const Projector &P = baseMLO->mymodel.PPref[iproj];
-					std::ostringstream mname;
-					mname << "model_it" << baseMLO->iter << "_class" << iproj;
-					OperandDump::Writer m(mname.str());
-					m.value("iter", baseMLO->iter).value("iclass", iproj)
-					 .value("xdim", P.data.xdim).value("ydim", P.data.ydim).value("zdim", P.data.zdim)
-					 .value("yinit", P.data.yinit).value("zinit", P.data.zinit)
-					 .value("r_max", P.r_max).value("padding_factor", P.padding_factor)
-					 .value("ori_size", P.ori_size).value("ref_dim", P.ref_dim)
-					 .array("data", reinterpret_cast<const RFLOAT *>(P.data.data), (size_t)P.data.nzyxdim * 2);
-				}
-			}
-		}
-#endif
-
 	} // end loop img_id
 
 #if defined(_SYCL_ENABLED) && ! defined(USE_ONEDPL)
@@ -1822,7 +1589,7 @@ void getAllSquaredDifferencesCoarse(
     //std::cerr << " min_diff2 coarse= " << op.min_diff2 << std::endl;
 
 #ifdef TIMING
-	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+	if (op.part_id == baseMLO->exp_my_first_part_id)
 		baseMLO->timer.toc(baseMLO->TIMING_ESP_DIFF1);
 #endif
 }
@@ -1844,7 +1611,7 @@ void getAllSquaredDifferencesFine(
 	int ibody)
 {
 #ifdef TIMING
-	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+	if (op.part_id == baseMLO->exp_my_first_part_id)
 		baseMLO->timer.tic(baseMLO->TIMING_ESP_DIFF2);
 #endif
 
@@ -2298,7 +2065,7 @@ void getAllSquaredDifferencesFine(
     //std::cerr << "  fine pass minweight  =  " << op.min_diff2 << std::endl;
 
 #ifdef TIMING
-	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+	if (op.part_id == baseMLO->exp_my_first_part_id)
 		baseMLO->timer.toc(baseMLO->TIMING_ESP_DIFF2);
 #endif
 }
@@ -2319,7 +2086,7 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
 											int ibody)
 {
 #ifdef TIMING
-	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+	if (op.part_id == baseMLO->exp_my_first_part_id)
 	{
 		if (exp_ipass == 0) baseMLO->timer.tic(baseMLO->TIMING_ESP_WEIGHT1);
 		else baseMLO->timer.tic(baseMLO->TIMING_ESP_WEIGHT2);
@@ -2372,10 +2139,7 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
 	// RELION_PDF_CACHE=1: without orientational priors (or with the alignment skipped) the orientation prior is the
 	// same for every particle of an iteration, so each thread builds it once per iteration and reuses it. On a
 	// miss it is built as below and copied into this thread's cache, on this thread's stream.
-	// RELION_PDF_CACHE=2 never uses the cache: it builds the prior every time and, where the cache holds one with
-	// the same key, compares the two bit for bit (totals printed at exit).
-	static const int pdf_cache_mode = getenv("RELION_PDF_CACHE") != NULL ? atoi(getenv("RELION_PDF_CACHE")) : 0;
-	static const bool pdf_cache = pdf_cache_mode > 0;
+	static const bool pdf_cache = getenv("RELION_PDF_CACHE") != NULL && atoi(getenv("RELION_PDF_CACHE")) > 0;
 	struct PdfOrientCache { long key[9]; XFLOAT *d_pdf = NULL; bool *d_zeros = NULL; size_t cap = 0; int dev = -1; bool valid = false; };
 	thread_local PdfOrientCache pdf_cached;
 	bool pdf_cache_use = false;
@@ -2390,7 +2154,7 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
 		                   (long) ((baseMLO->do_skip_align ? 1 : 0) + (baseMLO->do_skip_rotate ? 2 : 0))};
 		memcpy(pdf_key, k, sizeof(k));
 		pdf_cache_use = true;
-		if (pdf_cache_mode == 1 && pdf_cached.valid && memcmp(pdf_cached.key, pdf_key, sizeof(pdf_key)) == 0 && pdf_cached.cap >= pdf_n)
+		if (pdf_cached.valid && memcmp(pdf_cached.key, pdf_key, sizeof(pdf_key)) == 0 && pdf_cached.cap >= pdf_n)
 		{
 			pdf_orientation.freeIfSet();
 			pdf_orientation_zeros.freeIfSet();
@@ -2427,19 +2191,7 @@ void convertAllSquaredDifferencesToWeights(unsigned exp_ipass,
 	pdf_orientation_zeros.cpToDevice();
 #endif
 #ifdef _CUDA_ENABLED
-	if (pdf_cache_use && pdf_cache_mode == 2 && pdf_cached.valid && memcmp(pdf_cached.key, pdf_key, sizeof(pdf_key)) == 0
-	    && pdf_cached.cap >= pdf_n)
-	{
-		std::vector<XFLOAT> a(pdf_n), b(pdf_n);
-		std::vector<char> za(pdf_n), zb(pdf_n);
-		HANDLE_ERROR(cudaStreamSynchronize(pdf_orientation.getStream()));
-		HANDLE_ERROR(cudaMemcpy(a.data(), ~pdf_orientation, pdf_n * sizeof(XFLOAT), cudaMemcpyDeviceToHost));
-		HANDLE_ERROR(cudaMemcpy(b.data(), pdf_cached.d_pdf, pdf_n * sizeof(XFLOAT), cudaMemcpyDeviceToHost));
-		HANDLE_ERROR(cudaMemcpy(za.data(), ~pdf_orientation_zeros, pdf_n * sizeof(bool), cudaMemcpyDeviceToHost));
-		HANDLE_ERROR(cudaMemcpy(zb.data(), pdf_cached.d_zeros, pdf_n * sizeof(bool), cudaMemcpyDeviceToHost));
-		pdfCacheCheck().record(memcmp(a.data(), b.data(), pdf_n * sizeof(XFLOAT)) == 0 && za == zb);
-	}
-	else if (pdf_cache_use)
+	if (pdf_cache_use)
 	{
 		if (pdf_cached.cap < pdf_n || pdf_cached.dev != (int) pdf_key[1])
 		{
@@ -2576,9 +2328,6 @@ pdf_orientation_ready:
             // scored in this pass, which were never written; nothing reads them.)
             memset(op.Mcoarse_significant.data, 0, XSIZE(op.Mcoarse_significant) * sizeof(bool));
             DIRECT_A1D_ELEM(op.Mcoarse_significant, min_pair.first) = true;
-#ifdef CC_WEIGHTS_SELFCHECK
-            cc_weights_selfcheck(PassWeights.weights, op.Mcoarse_significant, my_significant_weight);
-#endif
         }
         else
         {
@@ -2843,8 +2592,8 @@ pdf_orientation_ready:
                 arrayOverThreshold<XFLOAT>(unsorted_ipart, Mcoarse_significant, significant_weight);
                 // RELION_SIG_COMPACT=1: bring back only the significant entries' indices (few, in a global search)
                 // instead of the whole mask, and set the same mask on the host
-                static const int sig_compact = getenv("RELION_SIG_COMPACT") != NULL ? atoi(getenv("RELION_SIG_COMPACT")) : 0;
-                if (sig_compact > 0 && ipart_length < (unsigned long) INT_MAX)
+                static const bool sig_compact = getenv("RELION_SIG_COMPACT") != NULL && atoi(getenv("RELION_SIG_COMPACT")) > 0;
+                if (sig_compact && ipart_length < (unsigned long) INT_MAX)
                 {
                     AccPtr<int> sig_idx = ptrFactory.make<int>((size_t) ipart_length);
                     sig_idx.deviceAlloc();
@@ -2864,19 +2613,6 @@ pdf_orientation_ready:
                     for (int i = 0; i < nsig; i++)
                         op.Mcoarse_significant_idx[i] = (long) offset + h_idx[i];
                     op.Mcoarse_significant_idx_valid = true;
-                    if (sig_compact == 2)
-                    {
-                        std::vector<bool> compact(mask, mask + ipart_length);
-                        Mcoarse_significant.cpToHost();  // the full mask, into the same host array
-                        DEBUG_HANDLE_ERROR(cudaStreamSynchronize(cudaStreamPerThread));
-                        bool same = true;
-                        for (unsigned long i = 0; i < ipart_length; i++)
-                            if (compact[i] != mask[i]) { same = false; break; }
-                        sig_compact_totals.checked++;
-                        sig_compact_totals.entries += (long long) ipart_length;
-                        sig_compact_totals.significant += nsig;
-                        if (!same) sig_compact_totals.mismatched++;
-                    }
                 }
                 else
                     Mcoarse_significant.cpToHost();
@@ -3085,7 +2821,7 @@ pdf_orientation_ready:
     op.significant_weight = (RFLOAT) my_significant_weight;
 
 #ifdef TIMING
-	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+	if (op.part_id == baseMLO->exp_my_first_part_id)
 	{
 		if (exp_ipass == 0) baseMLO->timer.toc(baseMLO->TIMING_ESP_WEIGHT1);
 		else baseMLO->timer.toc(baseMLO->TIMING_ESP_WEIGHT2);
@@ -3107,7 +2843,7 @@ void storeWeightedSums(OptimisationParamters &op, SamplingParameters &sp,
 						int ibody, AccPtrBundle &bundleSWS)
 {
 #ifdef TIMING
-	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+	if (op.part_id == baseMLO->exp_my_first_part_id)
 		baseMLO->timer.tic(baseMLO->TIMING_ESP_WSUM);
 #endif
 	CTIC(accMLO->timer,"store_init");
@@ -3930,7 +3666,7 @@ void storeWeightedSums(OptimisationParamters &op, SamplingParameters &sp,
 						op.local_Minvsigma2.xdim - 1);
 
 	#ifdef TIMING
-				if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+				if (op.part_id == baseMLO->exp_my_first_part_id)
 					baseMLO->timer.tic(baseMLO->TIMING_WSUM_BACKPROJ);
 	#endif
 
@@ -3968,7 +3704,7 @@ void storeWeightedSums(OptimisationParamters &op, SamplingParameters &sp,
 				CTOC(accMLO->timer,"backproject");
 
 	#ifdef TIMING
-				if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+				if (op.part_id == baseMLO->exp_my_first_part_id)
 					baseMLO->timer.toc(baseMLO->TIMING_WSUM_BACKPROJ);
 	#endif
 
@@ -4207,7 +3943,7 @@ void storeWeightedSums(OptimisationParamters &op, SamplingParameters &sp,
 
 	CTOC(accMLO->timer,"store_post_gpu");
 #ifdef TIMING
-	if (op.part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id])
+	if (op.part_id == baseMLO->exp_my_first_part_id)
 		baseMLO->timer.toc(baseMLO->TIMING_ESP_WSUM);
 #endif
 }
@@ -4673,7 +4409,6 @@ static void getAllSquaredDifferencesCoarseBatch(
 							~(*pp->corr), &(~(*pp->Fimg))[0], &(~(*pp->Fimg))[P], ~plans[c].eulers,
 							&(~(*pp->allWeights))[pp->classPos[c]], (XFLOAT) pp->op->local_sqrtXi2[0], O, T, P,
 							stream, false, false);
-					CoarseGemm::totals.kernel++;
 				}
 			}
 			else
@@ -4715,51 +4450,6 @@ static void getAllSquaredDifferencesCoarseBatch(
 				CoarseGemm::cuda_kernel_coarse_gemm_scatter<<<dim3((unsigned) O, (unsigned) nP), 64, 0, stream>>>(
 						~C, ~dst, nP, (int) T, 0);
 				LAUNCH_HANDLE_ERROR(cudaGetLastError());
-				CoarseGemm::totals.gemm += nP;
-				CoarseGemm::totals.batches++;
-				CoarseGemm::totals.batched += nP;
-
-				// Check (RELION_COARSE_GEMM_CHECK=n): every n-th particle also by the kernel; the GEMM's scores are kept.
-				for (int p = 0; p < nP; p++)
-				{
-					if (!(CoarseGemm::checkCount() > 0 && CoarseGemm::totals.seen++ % CoarseGemm::checkCount() == 0))
-						continue;
-					CoarseGemm::totals.checked++;
-					AccBatchParticle *pp = g[p];
-					const size_t n = O * T;
-					AccPtr<XFLOAT> dG = ptrFactory.make<XFLOAT>(n), dK = ptrFactory.make<XFLOAT>(n);
-					dG.setStream(stream); dK.setStream(stream);
-					dG.allAlloc(); dK.allAlloc();
-					deviceInitValue<XFLOAT>(dG, 0); deviceInitValue<XFLOAT>(dK, 0);
-					AccPtr<XFLOAT *> one_dst = ptrFactory.make<XFLOAT *>((size_t) 1);
-					one_dst.setStream(stream);
-					one_dst.allAlloc();
-					one_dst[0] = ~dG;
-					one_dst.cpToDevice();
-					CoarseGemm::cuda_kernel_coarse_gemm_scatter<<<dim3((unsigned) O, 1u), 64, 0, stream>>>(
-							~C, ~one_dst, nP, (int) T, p);
-					LAUNCH_HANDLE_ERROR(cudaGetLastError());
-					runDiff2KernelCoarse(projKernel, &(~(*pp->trans))[0], &(~(*pp->trans))[T], &(~(*pp->trans))[2 * T],
-							~(*pp->corr), &(~(*pp->Fimg))[0], &(~(*pp->Fimg))[P], ~plans[c].eulers, ~dK,
-							(XFLOAT) pp->op->local_sqrtXi2[0], O, T, P, stream, false, false);
-					dG.cpToHost(); dK.cpToHost(); dK.streamSync();
-					double maxDiff = 0., maxK = 0., maxRel = 0.;
-					size_t nonFinite = 0, iG = 0, iK = 0;
-					for (size_t i = 0; i < n; i++)
-					{
-						if (!std::isfinite((double) dG[i])) { nonFinite++; continue; }
-						if (dG[i] < dG[iG]) iG = i;
-						if (dK[i] < dK[iK]) iK = i;
-						const double d = fabs((double) dG[i] - (double) dK[i]), k = fabs((double) dK[i]);
-						maxDiff = std::max(maxDiff, d);
-						maxK = std::max(maxK, k);
-						if (k > 0.) maxRel = std::max(maxRel, d / k);
-					}
-					printf("coarse-gemm-check iter %d class %d: %zu orientations x %zu translations, %zu pixels: "
-					       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e, non-finite %zu, best moved %d, kernel gap %.3e (batch of %d)\n",
-					       baseMLO->iter, c, O, T, P, maxDiff, maxK, maxRel, nonFinite, (int) (iG != iK), (double) dK[iG] - (double) dK[iK], nP);
-					fflush(stdout);
-				}
 			}
 			for (AccBatchParticle *pp : g)
 				mapAllWeightsToMweights(~plans[c].iorientclasses, &(~(*pp->allWeights))[pp->classPos[c]],
@@ -4873,16 +4563,7 @@ void accDoExpectationParticleBatch(MlClass *myInstance, unsigned long first_sort
 	std::vector<AccBatchParticle *> raw;
 	for (std::unique_ptr<AccBatchParticle> &up : parts)
 		raw.push_back(up.get());
-#ifdef TIMING
-	const bool timeIt = (raw[0]->part_id == baseMLO->mydata.sorted_idx[baseMLO->exp_my_first_part_id]);
-	if (timeIt)
-		baseMLO->timer.tic(baseMLO->TIMING_ESP_DIFF1);
-#endif
 	getAllSquaredDifferencesCoarseBatch<MlClass>(raw, baseMLO, myInstance, ptrFactory);
-#ifdef TIMING
-	if (timeIt)
-		baseMLO->timer.toc(baseMLO->TIMING_ESP_DIFF1);
-#endif
 
 	// 3. Each particle's coarse weights, fine pass and weighted sums, as accDoExpectationOneParticle.
 	for (std::unique_ptr<AccBatchParticle> &up : parts)

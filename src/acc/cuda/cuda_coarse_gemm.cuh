@@ -27,9 +27,6 @@
  * fp32 data and fp32 accumulation, cuBLAS rounding the inputs to 16 bits inside the product). fp16 keeps
  * TF32's 10 mantissa bits but has a range of only 6.5e4, so large R and Q entries become infinite; bf16
  * keeps fp32's range with 7 mantissa bits. bf16 needs sm_80 or newer; older GPUs run mode 4 as mode 1.
- * The check mode below counts non-finite scores as well as the largest difference. With RELION_COARSE_GEMM_CHECK=<n> as well, every
- * n-th eligible image and class is scored both ways, the largest difference is printed, and the
- * kernel's scores are kept for that one; all others use the GEMM.
  *
  * RELION_COARSE_GEMM_BATCH=<B> (B >= 2, with the GEMM on) scores B particles of one thread in one GEMM:
  * each particle's translation columns side by side in Q, the product into a scratch matrix, and each
@@ -42,9 +39,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
-#include <atomic>
 #include <mutex>
-#include <unistd.h>
 #include "src/acc/cuda/cuda_settings.h"
 #include "src/acc/cuda/cuda_kernels/cuda_device_utils.cuh"
 #include "src/acc/acc_projectorkernel_impl.h"
@@ -65,12 +60,6 @@ inline int batch()
 {
 	static const int b = getenv("RELION_COARSE_GEMM_BATCH") ? atoi(getenv("RELION_COARSE_GEMM_BATCH")) : 1;
 	return b;
-}
-
-inline int checkCount()
-{
-	static const int n = getenv("RELION_COARSE_GEMM_CHECK") ? atoi(getenv("RELION_COARSE_GEMM_CHECK")) : 0;
-	return n;
 }
 
 // Columns of R and Q (K of the product).
@@ -181,22 +170,6 @@ static __global__ void cuda_kernel_coarse_gemm_scatter(
 	for (int t = threadIdx.x; t < T; t += blockDim.x)
 		d[o * T + t] += C[o * ldc + (size_t) p * T + t];
 }
-
-// Counts, printed by each process at exit when the GEMM path is enabled.
-struct Totals
-{
-	std::atomic<long long> gemm{0}, kernel{0}, checked{0}, seen{0}, batches{0}, batched{0};
-	~Totals()
-	{
-		if (mode() > 0)
-			printf("coarse-gemm pid %d: %lld image-class scorings by GEMM (mode %d), %lld by the kernel, %lld checked; "
-			       "%lld batched GEMMs holding %lld image-class scorings (batch %d)\n",
-			       (int) getpid(), (long long) gemm, mode(), (long long) kernel, (long long) checked,
-			       (long long) batches, (long long) batched, batch());
-		fflush(stdout);
-	}
-};
-static Totals totals;
 
 inline void handleCublas(cublasStatus_t s, const char *what)
 {

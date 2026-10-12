@@ -12,8 +12,6 @@
 #include "src/macros.h"
 #include "src/error.h"
 */
-#include <atomic>
-#include <unistd.h>
 #ifdef _CUDA_ENABLED
 	using deviceStream_t = cudaStream_t;
 #elif _HIP_ENABLED
@@ -264,25 +262,6 @@ void generateEulerMatrices(
 }
 
 
-// Totals of RELION_SIG_COMPACT=2's comparison in generateProjectionSetupFine, printed at exit.
-struct SigFineCheckTotals
-{
-	std::atomic<long long> checked{0}, differ{0};
-	void record(bool same) { checked++; if (!same) differ++; }
-	~SigFineCheckTotals()
-	{
-		if (checked > 0)
-			printf("sig-fine-check pid %d: %lld class setups checked, %lld differ\n", (int) getpid(), (long long) checked,
-			       (long long) differ);
-		fflush(stdout);
-	}
-};
-inline SigFineCheckTotals &sigFineCheck()
-{
-	static SigFineCheckTotals t;
-	return t;
-}
-
 long unsigned generateProjectionSetupFine(
 		OptimisationParamters &op,
 		SamplingParameters &sp,
@@ -324,32 +303,25 @@ long unsigned generateProjectionSetupFine(
 	};
 
 	// RELION_SIG_COMPACT: the coarse pass's significant entries are known as a sorted index list, so visit only
-	// their orientations, in the same increasing order as the scan below. With RELION_SIG_COMPACT=2 the scan
-	// runs instead and the two lists of orientations are compared (sigFineCheck).
-	static const int sig_compact = getenv("RELION_SIG_COMPACT") != NULL ? atoi(getenv("RELION_SIG_COMPACT")) : 0;
-	std::vector<long> from_idx;
+	// their orientations, in the same increasing order as the scan below.
 	if (op.Mcoarse_significant_idx_valid && sp.nr_trans > 0)
 	{
 		const long first = (long) iclass * sp.nr_dir * sp.nr_psi, end = first + sp.nr_dir * sp.nr_psi;
+		long last = -1;
 		for (long g : op.Mcoarse_significant_idx)
 		{
 			const long iorientclass = g / sp.nr_trans;
-			if (iorientclass >= first && iorientclass < end && (from_idx.empty() || from_idx.back() != iorientclass))
-				from_idx.push_back(iorientclass);
-		}
-		if (sig_compact != 2)
-		{
-			for (long iorientclass : from_idx)
+			if (iorientclass >= first && iorientclass < end && iorientclass != last)
 			{
 				const long iorient = iorientclass - first;
 				addOrientation(sp.idir_min + iorient / sp.nr_psi, sp.ipsi_min + iorient % sp.nr_psi, iorientclass);
+				last = iorientclass;
 			}
-			ProjectionData.orientation_num[iclass]=orientation_num;
-			return orientation_num;
 		}
+		ProjectionData.orientation_num[iclass]=orientation_num;
+		return orientation_num;
 	}
 
-	std::vector<long> scanned;
 	for (long int idir = sp.idir_min, iorient = 0; idir <= sp.idir_max; idir++)
 	{
 		for (long int ipsi = sp.ipsi_min; ipsi <= sp.ipsi_max; ipsi++, iorient++)
@@ -359,13 +331,9 @@ long unsigned generateProjectionSetupFine(
 			if (baseMLO->isSignificantAnyImageAnyTranslation(iorientclass, sp.itrans_min, sp.itrans_max, op.Mcoarse_significant))
 			{
 				addOrientation(idir, ipsi, iorientclass);
-				if (op.Mcoarse_significant_idx_valid)
-					scanned.push_back(iorientclass);
 			}
 		}
 	}
-	if (op.Mcoarse_significant_idx_valid)
-		sigFineCheck().record(scanned == from_idx);
 	ProjectionData.orientation_num[iclass]=orientation_num;
 	return orientation_num;
 }

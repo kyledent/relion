@@ -19,10 +19,6 @@
 #include "src/macros.h"
 #include "src/error.h"
 #include "src/parallel.h"
-#ifdef TIMING
-#include <atomic>
-#include <chrono>
-#endif
 
 #ifdef CUSTOM_ALLOCATOR_MEMGUARD
 #include "src/acc/cuda/shortcuts.cuh"
@@ -219,9 +215,6 @@ private:
 		if (e == 0)
 		{
 			DEBUG_HANDLE_ERROR(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
-#ifdef TIMING
-			stat_events_created++;
-#endif
 		}
 		return e;
 	}
@@ -232,38 +225,6 @@ private:
 		eventPool.push_back(e);
 		omp_unset_lock(&eventPoolMutex);
 	}
-
-#ifdef TIMING
-	// Contention counters, TIMING builds only: every thread of the process takes this lock, and
-	// alloc() walks the whole allocation list (querying the ready event of every pending deferred
-	// free) while holding it. Printed per allocator when it is destroyed.
-	std::atomic<long long> stat_wait_ns{0}, stat_hold_ns{0}, stat_locks{0},
-	                       stat_event_queries{0}, stat_list_steps{0}, stat_events_created{0};
-
-	class TimedLock
-	{
-		CudaCustomAllocator &a;
-		std::chrono::steady_clock::time_point acquired;
-	public:
-		explicit TimedLock(CudaCustomAllocator &allocator) : a(allocator)
-		{
-			std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-			omp_set_lock(&a.mutex);
-			acquired = std::chrono::steady_clock::now();
-			a.stat_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(acquired - t0).count();
-			a.stat_locks++;
-		}
-		~TimedLock()
-		{
-			a.stat_hold_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-					std::chrono::steady_clock::now() - acquired).count();
-			omp_unset_lock(&a.mutex);
-		}
-	};
-#define CCA_LOCK TimedLock ml(*this)
-#else
-#define CCA_LOCK Lock ml(&mutex)
-#endif
 
 
 	//Look for the first suited space
@@ -308,15 +269,9 @@ private:
 		{
 			curr = next;
 			next = curr->next;
-#ifdef TIMING
-			stat_list_steps++;
-#endif
 
 			if (! curr->free && curr->freeWhenReady && curr->readyEvent != 0)
 			{
-#ifdef TIMING
-				stat_event_queries++;
-#endif
 				cudaError_t e = cudaEventQuery(curr->readyEvent);
 
 				if (e == cudaSuccess)
@@ -657,7 +612,7 @@ public:
 
 	void resize(size_t size)
 	{
-		CCA_LOCK;
+		Lock ml(&mutex);
 		_clear();
 		totalSize = size;
 		_setup();
@@ -666,7 +621,7 @@ public:
 
 	Alloc* alloc(size_t requestedSize)
 	{
-		CCA_LOCK;
+		Lock ml(&mutex);
 
 		_freeReadyAllocs();
 
@@ -787,16 +742,9 @@ public:
 	~CudaCustomAllocator()
 	{
 		{
-			CCA_LOCK;
+			Lock ml(&mutex);
 			_clear();
 		}
-#ifdef TIMING
-		printf("allocator-stats pid %d: %lld locks, waited %.3f s, held %.3f s, %lld list steps, "
-		       "%lld event queries, %lld events created\n", (int)getpid(), (long long)stat_locks,
-		       1e-9 * stat_wait_ns, 1e-9 * stat_hold_ns, (long long)stat_list_steps,
-		       (long long)stat_event_queries, (long long)stat_events_created);
-		fflush(stdout);
-#endif
 		for (size_t i = 0; i < eventPool.size(); i++)
 			DEBUG_HANDLE_ERROR(cudaEventDestroy(eventPool[i]));
 		omp_destroy_lock(&eventPoolMutex);
@@ -812,57 +760,56 @@ public:
 			a->owner->free(a);
 			return;
 		}
-		CCA_LOCK;
+		Lock ml(&mutex);
 		_free(a);
 	}
 
 	void syncReadyEvents()
 	{
-		CCA_LOCK;
+		Lock ml(&mutex);
 		_syncReadyEvents();
 	}
 
 	void freeReadyAllocs()
 	{
-		CCA_LOCK;
+		Lock ml(&mutex);
 		_freeReadyAllocs();
 	}
 
 	size_t getTotalFreeSpace()
 	{
-		CCA_LOCK;
+		Lock ml(&mutex);
 		size_t size = _getTotalFreeSpace();
 		return size;
 	}
 
 	size_t getTotalUsedSpace()
 	{
-		CCA_LOCK;
+		Lock ml(&mutex);
 		size_t size = _getTotalUsedSpace();
 		return size;
 	}
 
 	size_t getNumberOfAllocs()
 	{
-		CCA_LOCK;
+		Lock ml(&mutex);
 		size_t size = _getNumberOfAllocs();
 		return size;
 	}
 
 	size_t getLargestContinuousFreeSpace()
 	{
-		CCA_LOCK;
+		Lock ml(&mutex);
 		size_t size = _getLargestContinuousFreeSpace();
 		return size;
 	}
 
 	void printState()
 	{
-		CCA_LOCK;
+		Lock ml(&mutex);
 		_printState();
 	}
 };
 //
 
-#undef CCA_LOCK
 #endif
