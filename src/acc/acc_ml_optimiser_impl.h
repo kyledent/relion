@@ -69,7 +69,7 @@ static XFLOAT *coarseGemmMatrix(
 			return e.R;
 	if (cache.disabled)
 		return NULL;
-	const size_t bytes = orientation_num * ld * sizeof(XFLOAT);
+	const size_t bytes = (orientation_num * ld + CoarseGemm::R_EXTRA) * sizeof(XFLOAT);
 	if (bytes > accMLO->bundle->allocator->getLargestContinuousFreeSpace() / 4)
 	{
 		cache.disabled = true;
@@ -80,6 +80,17 @@ static XFLOAT *coarseGemmMatrix(
 	CoarseGemm::cuda_kernel_coarse_gemm_R<<<orientation_num, COARSE_GEMM_BLOCK, 0, stream>>>(
 			d_eulers, projKernel, R, (int) image_size, ld);
 	LAUNCH_HANDLE_ERROR(cudaGetLastError());
+	if (CoarseGemm::sixteenBit())
+	{
+		// One power of two for the cross rows (Re, Im) of this R, from its own maximum; kept just past R.
+		float *slot = CoarseGemm::rScale(R, orientation_num, ld);
+		HANDLE_ERROR(cudaMemsetAsync(slot, 0, 2 * sizeof(float), stream));
+		CoarseGemm::cuda_kernel_coarse_gemm_maxabs<<<256, 256, 0, stream>>>(R, ld, 2 * image_size, orientation_num,
+				(unsigned int *) (slot + 1));
+		CoarseGemm::cuda_kernel_coarse_gemm_scale<<<256, 256, 0, stream>>>(R, ld, 2 * image_size, orientation_num,
+				(const unsigned int *) (slot + 1), slot);
+		LAUNCH_HANDLE_ERROR(cudaGetLastError());
+	}
 	// Other threads read it on their own streams.
 	HANDLE_ERROR(cudaStreamSynchronize(stream));
 	cache.entries.push_back({iclass, projKernel.imgX, projKernel.imgY, iter, image_size, orientation_num, ld, a, R});
@@ -99,6 +110,41 @@ static cublasHandle_t coarseGemmHandle(MlClass *accMLO, cudaStream_t stream)
 	}
 	CoarseGemm::handleCublas(cublasSetStream(h, stream), "set stream");
 	return h;
+}
+
+// The 16-bit product (modes 3, 4) of nP particles' Q (nP*T columns) with R: C (nP*T x O, ldc) gets the scores,
+// accumulated into C when accumulate, else overwritten. See cuda_coarse_gemm.cuh.
+static void coarseGemm16(cublasHandle_t h, AccPtrFactory &ptrFactory, XFLOAT *R, XFLOAT *Q, size_t ld, size_t P,
+		size_t nP, size_t T, size_t O, XFLOAT *C, size_t ldc, bool accumulate, cudaStream_t stream)
+{
+	const size_t nT = nP * T;
+	AccPtr<float> buf = ptrFactory.make<float>((size_t) 8);   // [maxQ bits, aQ, alpha, 1, 0]
+	buf.setStream(stream);
+	buf.deviceAlloc();
+	HANDLE_ERROR(cudaMemsetAsync(~buf, 0, 8 * sizeof(float), stream));
+	if (CoarseGemm::sixteenBit())
+	{
+		CoarseGemm::cuda_kernel_coarse_gemm_maxabs<<<256, 256, 0, stream>>>(Q, ld, 2 * P, nT, (unsigned int *) ~buf);
+		CoarseGemm::cuda_kernel_coarse_gemm_scale<<<256, 256, 0, stream>>>(Q, ld, 2 * P, nT, (const unsigned int *) ~buf,
+				~buf + 1);
+		CoarseGemm::cuda_kernel_coarse_gemm_alpha<<<1, 1, 0, stream>>>(CoarseGemm::rScale(R, O, ld), ~buf + 1, ~buf + 2);
+	}
+	else  // unscaled split (fp32, tf32): alpha 1
+		CoarseGemm::cuda_kernel_coarse_gemm_alpha<<<1, 1, 0, stream>>>(NULL, NULL, ~buf + 2);
+	LAUNCH_HANDLE_ERROR(cudaGetLastError());
+	CoarseGemm::handleCublas(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_DEVICE), "pointer mode device");
+	CoarseGemm::handleCublas(CoarseGemm::gemm(h, CUBLAS_OP_T, CUBLAS_OP_N, (int) nT, (int) O, (int) (2 * P),
+			~buf + 2, Q, (int) ld, R, (int) ld, accumulate ? ~buf + 3 : ~buf + 4, C, (int) ldc), "16-bit gemm");
+	CoarseGemm::handleCublas(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST), "pointer mode host");
+	// V (O x nP) = R[2P:3P]^T c, in fp32 (c: rows 2P..3P-1 of each particle's first Q column).
+	AccPtr<XFLOAT> V = ptrFactory.make<XFLOAT>(O * nP);
+	V.setStream(stream);
+	V.deviceAlloc();
+	const float one = 1.f, zero = 0.f;
+	CoarseGemm::handleCublas(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, (int) O, (int) nP, (int) P, &one, R + 2 * P,
+			(int) ld, Q + 2 * P, (int) (T * ld), &zero, ~V, (int) O), "sgemm |r|^2 c");
+	CoarseGemm::cuda_kernel_coarse_gemm_addback<<<512, 256, 0, stream>>>(C, ldc, ~V, Q, ld, P, nT, T, O);
+	LAUNCH_HANDLE_ERROR(cudaGetLastError());
 }
 
 // The coarse scores of one image and class as a GEMM (cuda_coarse_gemm.cuh), added into diff2s in the
@@ -138,8 +184,14 @@ static bool coarseGemmScores(
 
 	cublasHandle_t h = coarseGemmHandle(accMLO, stream);
 	// diff2s[o * T + t] += sum_k Q[t][k] R[o][k]: column-major C (T x O) += Q^T (T x K) R (K x O).
+	if (CoarseGemm::split())
+	{
+		coarseGemm16(h, ptrFactory, R, ~Q, ld, image_size, 1, translation_num, orientation_num, diff2s,
+				translation_num, true, stream);
+		return true;
+	}
 	const float one = 1.f;
-	CoarseGemm::handleCublas(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
+	CoarseGemm::handleCublas(CoarseGemm::gemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
 			(int) translation_num, (int) orientation_num, (int) K,
 			&one, ~Q, (int) ld, R, (int) ld, &one, diff2s, (int) translation_num), "sgemm");
 	return true;
@@ -1573,17 +1625,19 @@ void getAllSquaredDifferencesCoarse(
 						{
 							dG.cpToHost(); dK.cpToHost(); dK.streamSync();
 							double maxDiff = 0., maxK = 0., maxRel = 0.;
+							size_t nonFinite = 0;
 							for (size_t i = 0; i < n; i++)
 							{
+								if (!std::isfinite((double) dG[i])) { nonFinite++; continue; }
 								const double d = fabs((double) dG[i] - (double) dK[i]), k = fabs((double) dK[i]);
 								maxDiff = std::max(maxDiff, d);
 								maxK = std::max(maxK, k);
 								if (k > 0.) maxRel = std::max(maxRel, d / k);
 							}
 							printf("coarse-gemm-check iter %d class %d: %zu orientations x %lu translations, %lu pixels: "
-							       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e\n",
+							       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e, non-finite %zu\n",
 							       baseMLO->iter, (int) iclass, (size_t) plan.orientation_num, translation_num,
-							       image_size, maxDiff, maxK, maxRel);
+							       image_size, maxDiff, maxK, maxRel, nonFinite);
 							fflush(stdout);
 						}
 					}
@@ -4643,9 +4697,12 @@ static void getAllSquaredDifferencesCoarseBatch(
 				// C (nP*T x O, column-major) = Q^T (nP*T x K) R (K x O)
 				cublasHandle_t h = coarseGemmHandle(accMLO, stream);
 				const float one = 1.f, zero = 0.f;
-				CoarseGemm::handleCublas(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
-						(int) (nP * T), (int) O, (int) K, &one, ~Q, (int) ld, R, (int) ld, &zero, ~C, (int) (nP * T)),
-						"sgemm (batch)");
+				if (CoarseGemm::split())
+					coarseGemm16(h, ptrFactory, R, ~Q, ld, P, nP, T, O, ~C, nP * T, false, stream);
+				else
+					CoarseGemm::handleCublas(CoarseGemm::gemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
+							(int) (nP * T), (int) O, (int) K, &one, ~Q, (int) ld, R, (int) ld, &zero, ~C, (int) (nP * T)),
+							"sgemm (batch)");
 				keepPtrs.emplace_back(new AccPtr<XFLOAT *>(ptrFactory.make<XFLOAT *>((size_t) nP)));
 				AccPtr<XFLOAT *> &dst = *keepPtrs.back();
 				dst.setStream(stream);
@@ -4685,16 +4742,18 @@ static void getAllSquaredDifferencesCoarseBatch(
 							(XFLOAT) pp->op->local_sqrtXi2[0], O, T, P, stream, false, false);
 					dG.cpToHost(); dK.cpToHost(); dK.streamSync();
 					double maxDiff = 0., maxK = 0., maxRel = 0.;
+					size_t nonFinite = 0;
 					for (size_t i = 0; i < n; i++)
 					{
+						if (!std::isfinite((double) dG[i])) { nonFinite++; continue; }
 						const double d = fabs((double) dG[i] - (double) dK[i]), k = fabs((double) dK[i]);
 						maxDiff = std::max(maxDiff, d);
 						maxK = std::max(maxK, k);
 						if (k > 0.) maxRel = std::max(maxRel, d / k);
 					}
 					printf("coarse-gemm-check iter %d class %d: %zu orientations x %zu translations, %zu pixels: "
-					       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e (batch of %d)\n",
-					       baseMLO->iter, c, O, T, P, maxDiff, maxK, maxRel, nP);
+					       "max |gemm - kernel| %.3e, max |kernel| %.3e, max relative %.3e, non-finite %zu (batch of %d)\n",
+					       baseMLO->iter, c, O, T, P, maxDiff, maxK, maxRel, nonFinite, nP);
 					fflush(stdout);
 				}
 			}

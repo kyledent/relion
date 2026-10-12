@@ -23,7 +23,11 @@
  * (the kernel's own float atomics already make it run-to-run nondeterministic in the same way).
  *
  * RELION_COARSE_GEMM=1 enables it for global 3D searches of 2D images, one image per particle, no
- * cross-correlation (1: fp32; 2: TF32 tensor cores). With RELION_COARSE_GEMM_CHECK=<n> as well, every
+ * cross-correlation (1: fp32; 2: TF32 tensor cores; 3: fp16 tensor cores, 4: bf16 tensor cores, both with
+ * fp32 data and fp32 accumulation, cuBLAS rounding the inputs to 16 bits inside the product). fp16 keeps
+ * TF32's 10 mantissa bits but has a range of only 6.5e4, so large R and Q entries become infinite; bf16
+ * keeps fp32's range with 7 mantissa bits. bf16 needs sm_80 or newer; older GPUs run mode 4 as mode 1.
+ * The check mode below counts non-finite scores as well as the largest difference. With RELION_COARSE_GEMM_CHECK=<n> as well, every
  * n-th eligible image and class is scored both ways, the largest difference is printed, and the
  * kernel's scores are kept for that one; all others use the GEMM.
  *
@@ -202,6 +206,116 @@ inline void handleCublas(cublasStatus_t s, const char *what)
 		exit(EXIT_FAILURE);
 	}
 }
+
+// The GEMM in the selected precision: C = alpha op(A) op(B) + beta C, all fp32 in memory.
+// The mode in effect: bf16 (4) needs sm_80 or newer and runs as fp32 (1) on older GPUs.
+inline int effectiveMode()
+{
+	static const int eff = [] {
+		int m_ = mode();
+		if (m_ == 4)
+		{
+			int dev = 0, major = 0;
+			cudaGetDevice(&dev);
+			cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+			if (major < 8)
+			{
+				printf("coarse-gemm: bf16 needs sm_80 or newer; this GPU runs the GEMM in fp32 (mode 1)\n");
+				return 1;
+			}
+		}
+		return m_;
+	}();
+	return eff;
+}
+inline bool sixteenBit() { return effectiveMode() == 3 || effectiveMode() == 4; }
+// The rank-1 split (cross term K = 2P, |r|^2 c and s in fp32 afterwards): always for 16-bit, opt-in for fp32 and
+// tf32 with RELION_COARSE_GEMM_SPLIT=1 (then without scaling).
+inline bool split()
+{
+	static const bool s = sixteenBit() ||
+		(getenv("RELION_COARSE_GEMM_SPLIT") != NULL && atoi(getenv("RELION_COARSE_GEMM_SPLIT")) > 0);
+	return s;
+}
+
+// The GEMM in the selected precision: C = alpha op(A) op(B) + beta C, all fp32 in memory.
+inline cublasStatus_t gemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+		const float *alpha, const float *A, int lda, const float *B, int ldb, const float *beta, float *C, int ldc)
+{
+	if (sixteenBit())
+		return cublasGemmEx(h, ta, tb, m, n, k, alpha, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb, beta, C, CUDA_R_32F, ldc,
+				effectiveMode() == 3 ? CUBLAS_COMPUTE_32F_FAST_16F : CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+	return cublasSgemm(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+}
+
+/*
+ * 16-bit modes (3, 4). The 16-bit product takes only the cross term: rows 0..2P-1 of R and Q
+ * (Re and Im), K = 2P. The two rank-1 terms stay in fp32 and are added afterwards: sum_p c_p |r_op|^2
+ * depends only on the orientation (for a particle), so it is V = R[2P:3P]^T c, one fp32 GEMM with K = P
+ * whose columns are the particles; s_t (Q rows 3P, 3P+1) depends only on the translation. Each operand's
+ * cross rows are scaled by one power of two chosen from its own maximum in the same pass (R when it is
+ * built, Q per call), leaving a bit of headroom below fp16's 65504; the GEMM's alpha (a device value)
+ * undoes both exactly. A non-finite score after this is a bug, so the add kernel stops the run.
+ */
+// Largest |M[c*ld + r]| over r < rows, c < cols, into *out (float bits; *out zeroed by the caller).
+static __global__ void cuda_kernel_coarse_gemm_maxabs(const XFLOAT *M, size_t ld, size_t rows, size_t cols, unsigned int *out)
+{
+	float m = 0.f;
+	for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < rows * cols; i += (size_t) gridDim.x * blockDim.x)
+		m = fmaxf(m, fabsf(M[(i / rows) * ld + i % rows]));
+	for (int off = 16; off > 0; off >>= 1)
+		m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
+	if ((threadIdx.x & 31) == 0)
+		atomicMax(out, __float_as_uint(m));
+}
+// The power of two that brings max to at most 2^14.
+__device__ inline float pow2Scale(unsigned int maxbits)
+{
+	const float mx = __uint_as_float(maxbits);
+	if (!(mx > 0.f) || isinf(mx))
+		return 1.f;
+	int e;
+	frexpf(16384.f / mx, &e);
+	return ldexpf(1.f, e - 1);
+}
+// M[c*ld + r] *= scale for r < rows; the scale also into *scaleOut.
+static __global__ void cuda_kernel_coarse_gemm_scale(XFLOAT *M, size_t ld, size_t rows, size_t cols,
+		const unsigned int *maxbits, float *scaleOut)
+{
+	const float a = pow2Scale(*maxbits);
+	if (blockIdx.x == 0 && threadIdx.x == 0 && scaleOut != NULL)
+		*scaleOut = a;
+	for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < rows * cols; i += (size_t) gridDim.x * blockDim.x)
+		M[(i / rows) * ld + i % rows] *= a;
+}
+// v[0] = 1 / (aR * aQ) (exact: powers of two), v[1] = 1, v[2] = 0: the GEMM's alpha and betas.
+static __global__ void cuda_kernel_coarse_gemm_alpha(const float *aR, const float *aQ, float *v)
+{
+	v[0] = (aR != NULL && aQ != NULL) ? 1.f / (*aR * *aQ) : 1.f;   // NULL: unscaled
+	v[1] = 1.f;
+	v[2] = 0.f;
+}
+// C[o*ldc + i] += V[o + (i / T) * O] + s_i (s_i = Q[i*ld + 3P] + Q[i*ld + 3P + 1]); i < nT, o < O. Stops the run on
+// a non-finite score.
+static __global__ void cuda_kernel_coarse_gemm_addback(XFLOAT *C, size_t ldc, const XFLOAT *V, const XFLOAT *Q,
+		size_t ld, size_t P, size_t nT, size_t T, size_t O)
+{
+	for (size_t j = (size_t) blockIdx.x * blockDim.x + threadIdx.x; j < nT * O; j += (size_t) gridDim.x * blockDim.x)
+	{
+		const size_t i = j % nT, o = j / nT;
+		const float v = C[o * ldc + i] + V[o + (i / T) * O] + Q[i * ld + 3 * P] + Q[i * ld + 3 * P + 1];
+		if (!isfinite(v))
+		{
+			printf("coarse-gemm 16-bit: non-finite score (row %llu, orientation %llu): a bug; stopping\n",
+			       (unsigned long long) i, (unsigned long long) o);
+			__trap();
+		}
+		C[o * ldc + i] = v;
+	}
+}
+// R's scale lives just past the matrix (the cache allocates it).
+__host__ __device__ inline float *rScale(XFLOAT *R, size_t O, size_t ld) { return (float *) (R + O * ld); }
+const size_t R_EXTRA = 32;
 
 } // namespace CoarseGemm
 
