@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Run a command with its GPU processes as clients of a private NVIDIA MPS daemon, started for this
+# command and stopped after it, so several MPI workers share each GPU at once instead of
+# time-slicing between their CUDA contexts. Installed as relion_with_mps; see PERFORMANCE.md.
+#
+#   relion_with_mps [--gpus <ids>] -- <command> [args ...]
+#   e.g. relion_with_mps --gpus 1 -- mpirun -np 3 relion_refine_mpi ... --gpu 0 --j 4
+#
+# --gpus: the physical GPU ids the daemon serves (default: $CUDA_VISIBLE_DEVICES; required one way
+#         or the other, so the daemon never takes GPUs the caller was not given).
+#
+# What it does:
+#   - starts `nvidia-cuda-mps-control -d` for those GPUs, with a pipe and log directory private to
+#     this invocation (on local /tmp), so it cannot clash with another user's daemon or job;
+#   - runs the command with CUDA_MPS_PIPE_DIRECTORY set and CUDA_VISIBLE_DEVICES=0..n-1. An MPS
+#     client sees only the daemon's GPUs, renumbered from 0, so the physical ids would find no
+#     device. Address the GPUs as 0..n-1 in the command (RELION: --gpu 0, or --gpu 0:1 for two);
+#   - after the command, stops the daemon and reports how many distinct client processes it
+#     served (0 means the command did not use MPS, e.g. its launcher dropped the environment:
+#     with OpenMPI add -x CUDA_MPS_PIPE_DIRECTORY -x CUDA_VISIBLE_DEVICES);
+#   - exits with the command's exit status. The daemon's logs are kept if MPS_KEEP_LOGS names a
+#     directory.
+#
+# Needs no root and changes no GPU setting (compute mode Default or Exclusive_Process). A GPU's
+# memory is still divided between the workers (RELION divides the free memory evenly), so the
+# number of workers per GPU is bounded by memory.
+set -u
+gpus=${CUDA_VISIBLE_DEVICES:-}
+while [ $# -gt 0 ]; do
+    case $1 in
+    --gpus) gpus=${2:?--gpus needs a value}; shift 2 ;;
+    --) shift; break ;;
+    *) echo "usage: $0 [--gpus <ids>] -- <command> [args ...]" >&2; exit 2 ;;
+    esac
+done
+[ $# -gt 0 ] || { echo "usage: $0 [--gpus <ids>] -- <command> [args ...]" >&2; exit 2; }
+[ -n "$gpus" ] || { echo "$0: no GPUs given (--gpus or CUDA_VISIBLE_DEVICES)" >&2; exit 2; }
+command -v nvidia-cuda-mps-control > /dev/null || { echo "$0: nvidia-cuda-mps-control not found" >&2; exit 2; }
+
+root=$(mktemp -d /tmp/mps.XXXXXX)
+export CUDA_MPS_PIPE_DIRECTORY=$root/pipe
+log=$root/log
+mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$log"
+stop() {
+    echo quit | nvidia-cuda-mps-control > /dev/null 2>&1
+    sleep 2
+    local n
+    # Volta and later log "Client {PID: n, Context ID: m} connected"; the legacy (pre-Volta) server
+    # logs "Client n disconnected".
+    n=$(awk '/Client \{PID: [0-9]+, Context ID: [0-9]+\} connected/ { match($0, /PID: [0-9]+/); c[substr($0, RSTART + 5, RLENGTH - 5)] = 1 }
+             /Legacy Server [0-9]+\] Client [0-9]+ disconnected/ { match($0, /Client [0-9]+/); c[substr($0, RSTART + 7, RLENGTH - 7)] = 1 }
+             END { print length(c) }' "$log/server.log" 2>/dev/null)
+    echo "relion_with_mps: the MPS daemon served ${n:-0} client process(es)" >&2
+    [ -n "${MPS_KEEP_LOGS:-}" ] && mkdir -p "$MPS_KEEP_LOGS" && cp "$log"/*.log "$MPS_KEEP_LOGS"/ 2>/dev/null
+    rm -rf "$root"
+}
+trap stop EXIT
+CUDA_VISIBLE_DEVICES=$gpus CUDA_MPS_LOG_DIRECTORY=$log nvidia-cuda-mps-control -d \
+    || { echo "$0: the MPS daemon did not start" >&2; exit 1; }
+n=$(echo "$gpus" | tr ',' '\n' | grep -c .)
+export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((n - 1)))
+"$@"

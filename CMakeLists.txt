@@ -646,6 +646,7 @@ list(APPEND RELION_SCRIPT_FILES
         star_datablock_ctfdat
         qsub.csh
         it.py
+        with_mps
 )
 
 add_custom_target(copy_scripts ALL)
